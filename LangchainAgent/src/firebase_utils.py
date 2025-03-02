@@ -568,6 +568,66 @@ class FirebaseClient:
             verification['message'] = f"Firebase verification failed: {str(e)}"
             return verification
     
+    def get_resource_metadata(self) -> dict:
+        """
+        Fetches metadata about available resources including:
+        - Locations
+        - Skills
+        - Ranks
+        
+        Returns:
+            dict: Dictionary containing lists of available locations, skills, and ranks
+        """
+        try:
+            if not self.is_connected:
+                return {
+                    'locations': [],
+                    'skills': [],
+                    'ranks': []
+                }
+            
+            # Initialize empty sets for uniqueness
+            locations = set()
+            skills = set()
+            ranks = set()
+            
+            # Get a reference to the employees collection
+            employees_ref = self.client.collection('employees')
+            employees = employees_ref.limit(100).stream()  # Limit to prevent large data loads
+            
+            # Collect metadata from employees
+            for employee in employees:
+                employee_data = employee.to_dict()
+                
+                # Extract location
+                if 'location' in employee_data and employee_data['location']:
+                    locations.add(employee_data['location'])
+                
+                # Extract skills
+                if 'skills' in employee_data and isinstance(employee_data['skills'], list):
+                    for skill in employee_data['skills']:
+                        if skill:  # Ensure the skill is not empty
+                            skills.add(skill)
+                
+                # Extract rank
+                if 'rank' in employee_data and isinstance(employee_data['rank'], dict):
+                    if 'official_name' in employee_data['rank'] and employee_data['rank']['official_name']:
+                        ranks.add(employee_data['rank']['official_name'])
+            
+            return {
+                'locations': list(locations),
+                'skills': list(skills),
+                'ranks': list(ranks)
+            }
+        
+        except Exception as e:
+            print(f"Error fetching resource metadata: {str(e)}")
+            return {
+                'locations': [],
+                'skills': [],
+                'ranks': []
+            }
+    
     def fetch_employees(self, locations=None, ranks=None, skills=None, weeks=None, availability_status=None, min_hours=None, limit=20, offset=0):
         """
         Fetch employees based on provided filters

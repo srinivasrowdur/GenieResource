@@ -54,7 +54,7 @@ if st.session_state.firebase_client is None:
         verification = st.session_state.firebase_client.verify_firebase_setup()
         
         if verification['employees_exist'] and verification['availability_exist']:
-            st.sidebar.success(f"✅ Connected to Firebase with {verification['employee_count']} employees")
+            pass  # Success message removed
         elif verification['employees_exist']:
             st.warning(f"⚠️ {verification['message']}")
             st.info("""
@@ -223,15 +223,6 @@ if prompt := st.chat_input("Ask about employees..."):
     # Add assistant response to chat history
     st.session_state.messages.append({"role": "assistant", "content": response})
 
-# Add debug info in an expander
-with st.expander("🔧 Debug Information", expanded=False):
-    st.write("Current Session State:")
-    st.write({
-        "agent_initialized": st.session_state.agent is not None,
-        "firebase_connected": st.session_state.firebase_client.is_connected if st.session_state.firebase_client else False,
-        "message_count": len(st.session_state.messages)
-    })
-
 # Sample queries in an expander
 with st.expander("📝 Sample Queries", expanded=False):
     st.markdown("""
@@ -254,4 +245,45 @@ with st.sidebar:
     - Who is available in Week 3?
     - Find employees with React skills who are available next week
     """)
+    
+    # Add helpful resource information in expandable sections
+    if st.session_state.firebase_client and st.session_state.firebase_client.is_connected:
+        # Get resource metadata if available
+        try:
+            metadata = st.session_state.firebase_client.get_resource_metadata()
+            
+            # Show locations in an expander
+            with st.expander("📍 Available Locations", expanded=False):
+                if metadata and 'locations' in metadata and metadata['locations']:
+                    st.markdown("You can search for employees in these locations:")
+                    for location in sorted(metadata['locations']):
+                        st.markdown(f"- {location}")
+                else:
+                    st.markdown("Location data is currently unavailable.")
+            
+            # Show skills in an expander
+            with st.expander("🔧 Common Skills", expanded=False):
+                if metadata and 'skills' in metadata and metadata['skills']:
+                    st.markdown("You can search for employees with these skills:")
+                    # Display top skills (limit to prevent overwhelming)
+                    skills_to_show = sorted(metadata['skills'])[:15]
+                    for skill in skills_to_show:
+                        st.markdown(f"- {skill}")
+                    if len(metadata['skills']) > 15:
+                        st.markdown("*(and more...)*")
+                else:
+                    st.markdown("Skills data is currently unavailable.")
+            
+            # Show ranks in an expander
+            with st.expander("🏅 Employee Ranks", expanded=False):
+                if metadata and 'ranks' in metadata and metadata['ranks']:
+                    st.markdown("You can search for employees by these ranks:")
+                    for rank in sorted(metadata['ranks']):
+                        st.markdown(f"- {rank}")
+                else:
+                    st.markdown("Rank data is currently unavailable.")
+                    
+        except Exception as e:
+            st.warning("Resource metadata could not be loaded.")
+            # Don't show the full error to users
     
