@@ -7,6 +7,7 @@ anthropic
 firebase-admin
 streamlit
 pydantic
+dotenv
 
 # Testing dependencies
 pytest
