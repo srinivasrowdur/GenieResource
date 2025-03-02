@@ -223,15 +223,6 @@ if prompt := st.chat_input("Ask about employees..."):
     # Add assistant response to chat history
     st.session_state.messages.append({"role": "assistant", "content": response})
 
-# Add debug info in an expander
-with st.expander("🔧 Debug Information", expanded=False):
-    st.write("Current Session State:")
-    st.write({
-        "agent_initialized": st.session_state.agent is not None,
-        "firebase_connected": st.session_state.firebase_client.is_connected if st.session_state.firebase_client else False,
-        "message_count": len(st.session_state.messages)
-    })
-
 # Sample queries in an expander
 with st.expander("📝 Sample Queries", expanded=False):
     st.markdown("""
