@@ -234,15 +234,16 @@ class ReActAgentGraph:
                 }
             
             # Based on the analysis, take appropriate action
-            if analysis["query_type"] == "followup" and analysis["needs_availability"]:
-                # Handle availability follow-up
-                resources = state.previous_results
-                logger.info(f"Using previous results ({len(resources)} resources)")
-                
+            if analysis["needs_availability"]:
                 # Calculate weeks based on the analysis
                 week_numbers = []
                 if analysis["time_period"]["type"] == "specific_weeks":
                     week_numbers = analysis["time_period"]["weeks"]
+                elif analysis["time_period"]["relative_reference"] == "same_as_previous":
+                    # Use the same weeks as the previous query
+                    if state.last_query and "week_numbers" in state.current_context:
+                        week_numbers = state.current_context["week_numbers"]
+                        logger.info(f"Using weeks from previous query: {week_numbers}")
                 else:
                     # Calculate weeks based on relative reference
                     current_week = datetime.now().isocalendar()[1]
@@ -253,10 +254,49 @@ class ReActAgentGraph:
                     elif analysis["time_period"]["relative_reference"] == "next_week":
                         week_numbers = [current_week + 1 if current_week < 52 else 1]
                 
+                # Store current week numbers in context for future reference
+                state.current_context["week_numbers"] = week_numbers
                 logger.info(f"Calculated week numbers: {week_numbers}")
                 
-                # Fetch availability data if needed
-                if self.firebase_client and not self.firebase_client.is_demo_mode:
+                if analysis["query_type"] == "followup":
+                    # Use existing resources for follow-up
+                    resources = state.previous_results
+                    logger.info(f"Using previous results ({len(resources)} resources)")
+                else:
+                    # New search - fetch resources first
+                    query_params = self.extract_query_parameters(message)
+                    resources = []
+                    
+                    if self.firebase_client and (self.firebase_client.is_connected or self.firebase_client.is_demo_mode):
+                        try:
+                            # Get the query parameters
+                            locations = query_params.get("locations", [])
+                            skills = query_params.get("skills", [])
+                            ranks = query_params.get("ranks", [])
+                            
+                            logger.info(f"Searching for: locations={locations}, skills={skills}, ranks={ranks}")
+                            
+                            # Use the standard get_resources method
+                            resources = self.firebase_client.get_resources(
+                                locations=locations,
+                                skills=skills,
+                                ranks=ranks,
+                                collection='employees',
+                                nested_ranks=True
+                            )
+                            
+                            logger.info(f"Found {len(resources)} resources in database")
+                            
+                            # Store results in state for follow-up questions
+                            state.previous_results = resources
+                            state.last_query = query_params
+                            
+                        except Exception as e:
+                            logger.error(f"Error querying resources: {e}")
+                            resources = []
+                
+                # Fetch availability data for the resources
+                if self.firebase_client and not self.firebase_client.is_demo_mode and resources and week_numbers:  # Only fetch if we have week numbers
                     employee_numbers = [str(r.get('employee_number')) for r in resources if r.get('employee_number')]
                     if employee_numbers:
                         availability_data = self.firebase_client._fetch_availability_batch(employee_numbers, week_numbers)
@@ -269,7 +309,7 @@ class ReActAgentGraph:
                             else:
                                 resource['availability'] = []
                 
-                # Let the agent generate a response based on the data
+                # Generate response with availability information
                 response_prompt = f"""You are Resource Genie, an AI assistant that helps users find resources based on their needs.
                 
                 The user asked about availability for {analysis["time_period"]["relative_reference"] or f"week(s) {week_numbers}"}.
