@@ -16,7 +16,7 @@ load_dotenv()
 
 # Set page config - must be the first Streamlit command
 st.set_page_config(
-    page_title="ResGenie - Resource Management Agent",
+    page_title="Resource Genie - Resource Management Agent",
     page_icon="🧞",
     layout="wide"
 )
@@ -189,7 +189,7 @@ if st.session_state.agent is None:
             st.session_state.agent = initialize_agent()
 
 # Title and description
-st.title("🧞 ResGenie")
+st.title("🧞 Resource Genie")
 
 # Display chat messages from history on app rerun
 for message in st.session_state.messages:
@@ -235,9 +235,9 @@ with st.expander("📝 Sample Queries", expanded=False):
 
 # Add information in the sidebar
 with st.sidebar:
-    st.title("About ResGenie")
+    st.title("About Resource Genie")
     st.markdown("""
-    ResGenie helps you find the right resources for your project.
+    Resource Genie helps you find the right resources for your project.
     
     You can ask questions like:
     - Find frontend developers in London
