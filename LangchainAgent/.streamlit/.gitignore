@@ -1,0 +1,2 @@
+# Ignore secrets file but keep the directory
+secrets.toml 

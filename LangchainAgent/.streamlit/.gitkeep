@@ -1,0 +1,2 @@
+# This file ensures the .streamlit directory is tracked by Git
+# while allowing specific files inside it to be ignored 
