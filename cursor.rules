@@ -1,0 +1,21 @@
+# Resource Management System Rules
+
+## Query Processing
+1. ALWAYS use LLM (Claude) for query processing
+2. NO regression to traditional NLP/regex methods
+3. Maintain semantic understanding and context awareness
+
+## Code Organization
+1. Keep query processing logic in agents.py
+2. Use firebase_utils.py for data access only
+3. Maintain clear separation between query processing and data access
+
+## Testing
+1. Test LLM query processing with varied inputs
+2. Verify context handling across conversations
+3. Validate structured query outputs
+
+## Performance
+1. Optimize LLM prompts for efficiency
+2. Cache common query patterns
+3. Monitor and log query processing times 
