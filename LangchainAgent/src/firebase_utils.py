@@ -10,6 +10,7 @@ import json
 import datetime
 import streamlit as st
 import warnings
+import uuid
 
 class FirebaseClient:
     """
@@ -1010,4 +1011,76 @@ class FirebaseClient:
             
         except Exception as e:
             print(f"Error fetching availability batch: {str(e)}")
-            return {} 
+            return {}
+    
+    def save_query_data(self, query, response, metadata=None, session_id=None):
+        """
+        Save user query and response data to the 'queries' collection in Firestore.
+        
+        Args:
+            query (str): The user's query string
+            response (str): The system's response to the query
+            metadata (dict): Dictionary containing extracted metadata:
+                - ranks (list): Ranks mentioned in the query
+                - locations (list): Locations mentioned in the query
+                - skills (list): Skills mentioned in the query
+                - availability (dict): Availability criteria used
+            session_id (str): Unique identifier for the user session
+                
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            if not self.is_connected:
+                print("Cannot save query data: Firebase client is not connected")
+                return False
+                
+            # Create a new document in the queries collection
+            query_ref = self.client.collection('queries').document()
+            
+            # Extract tags from metadata
+            tags = []
+            if metadata:
+                # Add locations as tags
+                if 'locations' in metadata and metadata['locations']:
+                    tags.extend([loc.lower() for loc in metadata['locations']])
+                
+                # Add skills as tags
+                if 'skills' in metadata and metadata['skills']:
+                    tags.extend([skill.lower() for skill in metadata['skills']])
+                
+                # Add ranks as tags
+                if 'ranks' in metadata and metadata['ranks']:
+                    tags.extend([rank.lower() for rank in metadata['ranks']])
+                
+                # Add availability as a tag if present
+                if 'availability' in metadata and metadata['availability']:
+                    if 'weeks' in metadata['availability'] and metadata['availability']['weeks']:
+                        tags.append('availability')
+                        for week in metadata['availability']['weeks']:
+                            tags.append(f"week{week}")
+                    
+                    if 'status' in metadata['availability'] and metadata['availability']['status']:
+                        for status in metadata['availability']['status']:
+                            tags.append(status.lower())
+            
+            # Create the document data
+            doc_data = {
+                'query': query,
+                'response': response,
+                'timestamp': datetime.datetime.now(),
+                'tags': list(set(tags)),  # Remove duplicates
+                'metadata': metadata or {},
+                'session_id': session_id or str(uuid.uuid4())
+            }
+            
+            # Save to Firestore
+            query_ref.set(doc_data)
+            print(f"✅ Query data saved to Firestore with ID: {query_ref.id}")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error saving query data: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False 

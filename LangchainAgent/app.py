@@ -4,6 +4,8 @@ Resource Management Agent - Streamlit UI
 
 import streamlit as st
 import os
+import uuid
+import re
 from dotenv import load_dotenv
 from src.master_agent import MasterAgent
 from src.query_translator import QueryTranslator
@@ -28,6 +30,10 @@ if "agent" not in st.session_state:
     st.session_state.agent = None
 if "firebase_client" not in st.session_state:
     st.session_state.firebase_client = None
+
+# Create or restore a session ID
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
 
 # Check for required environment variables
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
@@ -173,6 +179,66 @@ def initialize_agent():
         st.error(f"Error initializing components: {str(e)}")
         return None
 
+def extract_query_metadata(query, response):
+    """
+    Extract metadata from the query string and response.
+    
+    Args:
+        query (str): The user's query
+        response (str): The system's response
+        
+    Returns:
+        dict: Dictionary containing extracted metadata
+    """
+    metadata = {
+        'locations': [],
+        'ranks': [],
+        'skills': [],
+        'availability': {
+            'weeks': [],
+            'status': []
+        }
+    }
+    
+    # Get available metadata for reference
+    try:
+        if st.session_state.firebase_client and st.session_state.firebase_client.is_connected:
+            reference_metadata = st.session_state.firebase_client.get_resource_metadata()
+            
+            # Match locations in query
+            if 'locations' in reference_metadata and reference_metadata['locations']:
+                for location in reference_metadata['locations']:
+                    if location.lower() in query.lower():
+                        metadata['locations'].append(location)
+            
+            # Match ranks in query
+            if 'ranks' in reference_metadata and reference_metadata['ranks']:
+                for rank in reference_metadata['ranks']:
+                    if rank.lower() in query.lower():
+                        metadata['ranks'].append(rank)
+            
+            # Match skills in query
+            if 'skills' in reference_metadata and reference_metadata['skills']:
+                for skill in reference_metadata['skills']:
+                    if skill.lower() in query.lower():
+                        metadata['skills'].append(skill)
+    except Exception as e:
+        print(f"Error extracting metadata from reference: {str(e)}")
+    
+    # Extract availability information
+    week_pattern = r'week\s*(\d+)'
+    week_matches = re.findall(week_pattern, query.lower())
+    if week_matches:
+        metadata['availability']['weeks'] = [int(week) for week in week_matches]
+    
+    # Extract availability status
+    status_keywords = ['available', 'unavailable', 'partially available']
+    for status in status_keywords:
+        if status.lower() in query.lower():
+            metadata['availability']['status'].append(status)
+    
+    return metadata
+
 # Initialize agent if not already done
 if st.session_state.agent is None:
     # Check Firebase connection first
@@ -211,6 +277,19 @@ if prompt := st.chat_input("Ask about employees..."):
             try:
                 if st.session_state.agent:
                     response = st.session_state.agent.process_message(prompt)
+                    
+                    # Extract metadata from the query and response for storage
+                    query_metadata = extract_query_metadata(prompt, response)
+                    
+                    # Store query and response data in Firebase
+                    if st.session_state.firebase_client and st.session_state.firebase_client.is_connected:
+                        # Save query data in the background (don't block the UI)
+                        st.session_state.firebase_client.save_query_data(
+                            query=prompt,
+                            response=response,
+                            metadata=query_metadata,
+                            session_id=st.session_state.session_id
+                        )
                 else:
                     response = "Sorry, the agent is not properly initialized. Please check the system status in the sidebar."
                 st.markdown(response)

@@ -224,4 +224,79 @@ The Master Agent has been implemented using LangGraph for workflow orchestration
 3. **Documentation**
    - Add workflow diagrams
    - Document state management
-   - Create usage examples 
+   - Create usage examples
+
+# Plan for Storing User Queries and Responses in Firebase
+
+## Overview
+We need to store the user queries, AI responses, and associated metadata (tags, rank, location, skills, availability) in a Firebase collection. This data will be useful for analyzing user interactions, improving the system, and tracking usage patterns.
+
+## Implementation Plan
+
+### 1. Create a New Firebase Collection
+- Create a new collection called `queries` in Firestore
+- Each document will store:
+  - `query`: The user's original question
+  - `response`: The AI's response
+  - `timestamp`: When the query was made
+  - `tags`: Array of extracted tags/topics
+  - `metadata`: Object containing:
+    - `ranks`: Ranks mentioned or used in the query
+    - `locations`: Locations mentioned or used in the query
+    - `skills`: Skills mentioned or used in the query
+    - `availability`: Availability criteria used in the query
+  - `session_id`: Unique identifier for the user session
+
+### 2. Create a Setup Script
+- Write a script to initialize the `queries` collection
+- Ensure proper indexing for efficient querying
+- Add sample data for testing purposes
+
+### 3. Update FirebaseClient Class
+- Add a new method `save_query_data(query, response, metadata)` to save query information
+- Extract metadata from query and response
+- Store data in the `queries` collection
+
+### 4. Modify the App.py Process Flow
+- After a successful query and response:
+  - Extract metadata from the query and response
+  - Call the FirebaseClient method to save the data
+  - Ensure this does not impact the user experience
+
+### 5. Testing and Validation
+- Test the system with various queries
+- Verify data is properly stored in Firebase
+- Check that all metadata is correctly extracted and saved
+
+## Implementation Timeline
+1. Setup Script: Create a script to initialize the collection (1 day)
+2. Firebase Client Update: Add a new method to save query data (1 day)
+3. App.py Integration: Modify app.py to extract and save query data (1 day)
+4. Testing and Refinement: Test and refine the implementation (1-2 days)
+
+## Data Schema
+
+```json
+{
+  "query": "Find frontend developers in London",
+  "response": "I found 3 frontend developers in London...",
+  "timestamp": "2023-05-20T15:30:00Z",
+  "tags": ["frontend", "london", "availability"],
+  "metadata": {
+    "ranks": [],
+    "locations": ["London"],
+    "skills": ["frontend"],
+    "availability": {
+      "weeks": [],
+      "status": []
+    }
+  },
+  "session_id": "user123-session456"
+}
+```
+
+## Required Changes
+1. Add new method to `firebase_utils.py`
+2. Create initialization script for the collection
+3. Modify app.py to call the new method
+4. Implement metadata extraction from queries 
