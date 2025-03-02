@@ -323,66 +323,97 @@ class FirebaseClient:
         Fetch availability for multiple employees and weeks.
         
         Args:
-            employee_numbers: List of employee numbers
-            weeks: List of week numbers
+            employee_numbers: List of employee numbers (as strings)
+            weeks: List of week numbers (used for filtering after fetching all data)
         
         Returns:
             Dictionary mapping employee numbers to their availability data
         """
         results = {}
-        print(f"Fetching availability for {len(employee_numbers)} employees in weeks {weeks}")
+        logger.info(f"Fetching availability for {len(employee_numbers)} employees (will filter for weeks {weeks} after fetching)")
         
         try:
             # Convert weeks list to a set for faster lookup
             target_weeks = set(weeks) if weeks else set()
-            print(f"Looking for weeks: {target_weeks}")
+            logger.info(f"Will filter for weeks: {target_weeks}")
             
-            # Process employees in batches
+            # Process each employee
             for employee_number in employee_numbers:
                 if not employee_number:
+                    logger.warning(f"Skipping empty employee number")
                     continue
                     
                 # Get availability document
-                avail_doc = self.db.collection('availability').document(employee_number).get()
+                logger.info(f"Checking availability for employee {employee_number}")
+                avail_doc = self.db.collection('availability').document(str(employee_number)).get()
+                
                 if not avail_doc.exists:
+                    logger.warning(f"No availability document found for employee {employee_number}")
                     continue
-                    
+                
                 # Get weeks subcollection
                 weeks_ref = avail_doc.reference.collection('weeks')
                 employee_availability = []
                 
                 try:
-                    # Get all weeks without filtering
+                    # Get all weeks data first
+                    logger.info(f"Fetching all weeks data for employee {employee_number}")
                     all_weeks_query = weeks_ref.stream()
+                    all_weeks_data = []
                     
                     for week_doc in all_weeks_query:
                         week_data = week_doc.to_dict()
-                        if not week_data:
-                            continue
-                        
-                        week_num = week_data.get('week_number')
-                        # Only include weeks we're interested in
-                        if not target_weeks or week_num in target_weeks:
-                            print(f"Found availability for employee {employee_number}, week {week_num}: {week_data.get('status', 'Unknown')}")
-                            employee_availability.append({
-                                'week': week_num,
+                        if week_data and 'week_number' in week_data:
+                            all_weeks_data.append({
+                                'week': week_data.get('week_number'),
                                 'status': week_data.get('status', 'Unknown'),
                                 'notes': week_data.get('notes', ''),
                                 'hours': week_data.get('hours', 0)
                             })
-                except Exception as e:
-                    print(f"Error fetching weeks for employee {employee_number}: {str(e)}")
-                
-                # Sort the availability data by week number in memory
-                employee_availability.sort(key=lambda x: x.get('week', 0))
-                
-                # Only add to results if we found availability data
-                if employee_availability:
-                    results[employee_number] = employee_availability
                     
+                    logger.info(f"Found {len(all_weeks_data)} weeks of data for employee {employee_number}")
+                    
+                    # If specific weeks requested, filter the data
+                    if target_weeks:
+                        # First, sort all weeks data
+                        all_weeks_data.sort(key=lambda x: x.get('week', 0))
+                        
+                        # For requested weeks with no data, add unavailable status
+                        existing_weeks = {w.get('week') for w in all_weeks_data}
+                        for week_num in target_weeks:
+                            if week_num not in existing_weeks:
+                                all_weeks_data.append({
+                                    'week': week_num,
+                                    'status': 'Unavailable',
+                                    'notes': 'No availability data found',
+                                    'hours': 0
+                                })
+                        
+                        # Filter to only include requested weeks
+                        employee_availability = [
+                            week_data for week_data in all_weeks_data 
+                            if week_data.get('week') in target_weeks
+                        ]
+                    else:
+                        # Use all weeks data if no specific weeks requested
+                        employee_availability = all_weeks_data
+                    
+                    # Sort final availability data by week number
+                    employee_availability.sort(key=lambda x: x.get('week', 0))
+                    
+                    # Always add the results, even if empty (to indicate we checked)
+                    logger.info(f"Adding availability data for employee {employee_number}: {employee_availability}")
+                    results[str(employee_number)] = employee_availability
+                        
+                except Exception as e:
+                    logger.error(f"Error fetching weeks for employee {employee_number}: {str(e)}")
+                    continue
+            
+            logger.info(f"Returning availability data for {len(results)} employees")
             return results
+            
         except Exception as e:
-            print(f"Error fetching availability batch: {str(e)}")
+            logger.error(f"Error fetching availability batch: {str(e)}")
             return {}
     
     def get_resource_by_id(self, resource_id: str) -> Optional[Dict[str, Any]]:
