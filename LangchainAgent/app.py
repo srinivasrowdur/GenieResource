@@ -6,6 +6,12 @@ import streamlit as st
 import os
 import uuid
 import re
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from collections import Counter
+from datetime import datetime, timedelta
+import altair as alt
 from dotenv import load_dotenv
 from src.master_agent import MasterAgent
 from src.query_translator import QueryTranslator
@@ -239,6 +245,347 @@ def extract_query_metadata(query, response):
     
     return metadata
 
+def get_query_trends_data():
+    """
+    Fetch query trend data from Firebase
+    
+    Returns:
+        dict: Dictionary containing trend data
+    """
+    if not st.session_state.firebase_client or not st.session_state.firebase_client.is_connected:
+        return None
+        
+    try:
+        # Get queries collection
+        queries_ref = st.session_state.firebase_client.client.collection('queries')
+        
+        # Get all documents - in a real app with many queries, you'd want to limit this
+        # and implement pagination or filtering by date range
+        queries = list(queries_ref.order_by('timestamp', direction='DESCENDING').limit(100).stream())
+        
+        if not queries:
+            return {
+                'total_queries': 0,
+                'queries': [],
+                'dates': [],
+                'locations': [],
+                'skills': [],
+                'ranks': [],
+                'availability_status': [],
+                'availability_weeks': []
+            }
+        
+        # Process query data
+        processed_data = {
+            'total_queries': len(queries),
+            'queries': [],
+            'dates': [],
+            'locations': [],
+            'skills': [],
+            'ranks': [],
+            'availability_status': [],
+            'availability_weeks': []
+        }
+        
+        for query_doc in queries:
+            query_data = query_doc.to_dict()
+            
+            # Add the query text and response
+            processed_data['queries'].append({
+                'query': query_data.get('query', ''),
+                'response': query_data.get('response', ''),
+                'timestamp': query_data.get('timestamp', datetime.now()),
+                'session_id': query_data.get('session_id', '')
+            })
+            
+            # Add the timestamp for time-based analysis
+            timestamp = query_data.get('timestamp')
+            if timestamp:
+                processed_data['dates'].append(timestamp)
+            
+            # Extract metadata
+            metadata = query_data.get('metadata', {})
+            
+            # Add locations
+            locations = metadata.get('locations', [])
+            if locations:
+                processed_data['locations'].extend(locations)
+            
+            # Add skills
+            skills = metadata.get('skills', [])
+            if skills:
+                processed_data['skills'].extend(skills)
+            
+            # Add ranks
+            ranks = metadata.get('ranks', [])
+            if ranks:
+                processed_data['ranks'].extend(ranks)
+            
+            # Add availability info
+            availability = metadata.get('availability', {})
+            
+            # Add availability status
+            status_list = availability.get('status', [])
+            if status_list:
+                processed_data['availability_status'].extend(status_list)
+            
+            # Add availability weeks
+            weeks_list = availability.get('weeks', [])
+            if weeks_list:
+                processed_data['availability_weeks'].extend(weeks_list)
+        
+        return processed_data
+    
+    except Exception as e:
+        print(f"Error fetching query trends: {str(e)}")
+        return None
+
+def display_trends_dashboard():
+    """Display the trends dashboard with visualizations"""
+    st.title("📊 Query Trends Dashboard")
+    
+    with st.spinner("Loading trend data..."):
+        trends_data = get_query_trends_data()
+    
+    if not trends_data or trends_data['total_queries'] == 0:
+        st.info("No query data available yet. Start using the chat to generate trend data!")
+        return
+    
+    # Display key metrics in a nice layout
+    total_queries = trends_data['total_queries']
+    unique_sessions = len(set(q['session_id'] for q in trends_data['queries'] if q['session_id']))
+    unique_locations = len(set(trends_data['locations']))
+    unique_skills = len(set(trends_data['skills']))
+    
+    # Create an attractive metrics display with emojis and cards
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        st.markdown(
+            f"""
+            <div style="padding: 20px; background-color: #f0f7ff; border-radius: 10px; text-align: center;">
+                <h1 style="font-size: 40px;">🔍</h1>
+                <h2>{total_queries}</h2>
+                <p>Total Queries</p>
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
+    
+    with col2:
+        st.markdown(
+            f"""
+            <div style="padding: 20px; background-color: #fff0f7; border-radius: 10px; text-align: center;">
+                <h1 style="font-size: 40px;">👥</h1>
+                <h2>{unique_sessions}</h2>
+                <p>Unique Sessions</p>
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
+        
+    with col3:
+        st.markdown(
+            f"""
+            <div style="padding: 20px; background-color: #f0fff7; border-radius: 10px; text-align: center;">
+                <h1 style="font-size: 40px;">📍</h1>
+                <h2>{unique_locations}</h2>
+                <p>Locations Searched</p>
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
+        
+    with col4:
+        st.markdown(
+            f"""
+            <div style="padding: 20px; background-color: #f7f0ff; border-radius: 10px; text-align: center;">
+                <h1 style="font-size: 40px;">🔧</h1>
+                <h2>{unique_skills}</h2>
+                <p>Skills Searched</p>
+            </div>
+            """, 
+            unsafe_allow_html=True
+        )
+    
+    st.markdown("---")
+    
+    # Create visualizations for different types of data
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Top locations chart
+        if trends_data['locations']:
+            st.subheader("📍 Top Searched Locations")
+            location_counts = Counter(trends_data['locations'])
+            locations_df = pd.DataFrame({
+                'Location': list(location_counts.keys()),
+                'Count': list(location_counts.values())
+            }).sort_values('Count', ascending=False).head(8)
+            
+            fig = px.bar(
+                locations_df, 
+                x='Count', 
+                y='Location',
+                orientation='h',
+                color='Count',
+                color_continuous_scale=px.colors.sequential.Viridis,
+                title="Most Requested Locations"
+            )
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No location data available yet.")
+    
+    with col2:
+        # Top skills chart
+        if trends_data['skills']:
+            st.subheader("🔧 Top Requested Skills")
+            skill_counts = Counter(trends_data['skills'])
+            skills_df = pd.DataFrame({
+                'Skill': list(skill_counts.keys()),
+                'Count': list(skill_counts.values())
+            }).sort_values('Count', ascending=False).head(8)
+            
+            fig = px.pie(
+                skills_df, 
+                values='Count', 
+                names='Skill',
+                color_discrete_sequence=px.colors.sequential.RdBu,
+                title="Most Requested Skills",
+                hole=0.4
+            )
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No skills data available yet.")
+    
+    # Time-series analysis
+    if trends_data['dates']:
+        st.subheader("📅 Query Volume Over Time")
+        
+        # Group by date
+        date_counts = Counter(d.date() for d in trends_data['dates'])
+        dates_df = pd.DataFrame({
+            'Date': list(date_counts.keys()),
+            'Count': list(date_counts.values())
+        }).sort_values('Date')
+        
+        # Fill in missing dates
+        if len(dates_df) > 1:
+            date_range = pd.date_range(start=min(dates_df['Date']), end=max(dates_df['Date']))
+            full_df = pd.DataFrame({'Date': date_range})
+            dates_df = full_df.merge(dates_df, on='Date', how='left').fillna(0)
+        
+        fig = px.line(
+            dates_df, 
+            x='Date', 
+            y='Count',
+            markers=True,
+            line_shape='spline',
+            color_discrete_sequence=['#6200EA'],
+            title="Daily Query Volume"
+        )
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Additional visualizations
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Top ranks chart
+        if trends_data['ranks']:
+            st.subheader("🏅 Most Searched Ranks")
+            rank_counts = Counter(trends_data['ranks'])
+            ranks_df = pd.DataFrame({
+                'Rank': list(rank_counts.keys()),
+                'Count': list(rank_counts.values())
+            }).sort_values('Count', ascending=False)
+            
+            fig = px.bar(
+                ranks_df,
+                x='Rank',
+                y='Count',
+                color='Count',
+                color_continuous_scale=px.colors.sequential.Plasma,
+                title="Rank Distribution in Queries"
+            )
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No rank data available yet.")
+    
+    with col2:
+        # Availability status chart
+        if trends_data['availability_status']:
+            st.subheader("📆 Availability Search Patterns")
+            status_counts = Counter(trends_data['availability_status'])
+            status_df = pd.DataFrame({
+                'Status': list(status_counts.keys()),
+                'Count': list(status_counts.values())
+            })
+            
+            fig = px.bar(
+                status_df,
+                x='Status',
+                y='Count',
+                color='Status',
+                title="Availability Status in Queries"
+            )
+            fig.update_layout(height=400)
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No availability status data yet.")
+    
+    # Week popularity chart
+    if trends_data['availability_weeks']:
+        st.subheader("📊 Popular Weeks Searched")
+        week_counts = Counter(trends_data['availability_weeks'])
+        weeks_df = pd.DataFrame({
+            'Week': list(week_counts.keys()),
+            'Count': list(week_counts.values())
+        }).sort_values('Week')
+        
+        fig = px.line(
+            weeks_df,
+            x='Week',
+            y='Count',
+            markers=True,
+            title="Week Number Popularity",
+            color_discrete_sequence=['#FF6F00']
+        )
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True)
+    
+    # Recent queries section with nice formatting
+    if trends_data['queries']:
+        st.markdown("---")
+        st.subheader("🕒 Recent Queries")
+        
+        # Show the 5 most recent queries
+        recent_queries = trends_data['queries'][:5]
+        
+        for i, query_data in enumerate(recent_queries):
+            query = query_data.get('query', '')
+            timestamp = query_data.get('timestamp', datetime.now())
+            
+            # Format the timestamp nicely
+            if hasattr(timestamp, 'strftime'):
+                time_str = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+            else:
+                time_str = str(timestamp)
+            
+            # Create an attractive card for each query
+            st.markdown(
+                f"""
+                <div style="padding: 15px; background-color: #f8f9fa; border-radius: 10px; margin-bottom: 10px;">
+                    <p style="color: #6c757d; margin-bottom: 5px; font-size: 0.8em;">{time_str}</p>
+                    <p style="font-weight: bold; margin-bottom: 0;">"{query}"</p>
+                </div>
+                """, 
+                unsafe_allow_html=True
+            )
+
 # Initialize agent if not already done
 if st.session_state.agent is None:
     # Check Firebase connection first
@@ -254,63 +601,71 @@ if st.session_state.agent is None:
         else:
             st.session_state.agent = initialize_agent()
 
-# Title and description
+# Title and tabs
 st.title("🧞 Resource Genie")
 
-# Display chat messages from history on app rerun
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+# Create tabs for Chat and Trends
+chat_tab, trends_tab = st.tabs(["💬 Chat", "📈 Trends"])
 
-# Accept user input
-if prompt := st.chat_input("Ask about employees..."):
-    # Add user message to chat history
-    st.session_state.messages.append({"role": "user", "content": prompt})
+with chat_tab:
+    # Display chat messages from history on app rerun
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
     
-    # Display user message in chat message container
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    # Display assistant response in chat message container
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
-                if st.session_state.agent:
-                    response = st.session_state.agent.process_message(prompt)
-                    
-                    # Extract metadata from the query and response for storage
-                    query_metadata = extract_query_metadata(prompt, response)
-                    
-                    # Store query and response data in Firebase
-                    if st.session_state.firebase_client and st.session_state.firebase_client.is_connected:
-                        # Save query data in the background (don't block the UI)
-                        st.session_state.firebase_client.save_query_data(
-                            query=prompt,
-                            response=response,
-                            metadata=query_metadata,
-                            session_id=st.session_state.session_id
-                        )
-                else:
-                    response = "Sorry, the agent is not properly initialized. Please check the system status in the sidebar."
-                st.markdown(response)
-            except Exception as e:
-                error_msg = f"Error processing query: {str(e)}"
-                st.error(error_msg)
-                response = f"I encountered an error: {str(e)}"
-                st.markdown(response)
+    # Accept user input
+    if prompt := st.chat_input("Ask about employees..."):
+        # Add user message to chat history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        
+        # Display user message in chat message container
+        with st.chat_message("user"):
+            st.markdown(prompt)
     
-    # Add assistant response to chat history
-    st.session_state.messages.append({"role": "assistant", "content": response})
+        # Display assistant response in chat message container
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                try:
+                    if st.session_state.agent:
+                        response = st.session_state.agent.process_message(prompt)
+                        
+                        # Extract metadata from the query and response for storage
+                        query_metadata = extract_query_metadata(prompt, response)
+                        
+                        # Store query and response data in Firebase
+                        if st.session_state.firebase_client and st.session_state.firebase_client.is_connected:
+                            # Save query data in the background (don't block the UI)
+                            st.session_state.firebase_client.save_query_data(
+                                query=prompt,
+                                response=response,
+                                metadata=query_metadata,
+                                session_id=st.session_state.session_id
+                            )
+                    else:
+                        response = "Sorry, the agent is not properly initialized. Please check the system status in the sidebar."
+                    st.markdown(response)
+                except Exception as e:
+                    error_msg = f"Error processing query: {str(e)}"
+                    st.error(error_msg)
+                    response = f"I encountered an error: {str(e)}"
+                    st.markdown(response)
+        
+        # Add assistant response to chat history
+        st.session_state.messages.append({"role": "assistant", "content": response})
+    
+    # Sample queries in an expander
+    with st.expander("📝 Sample Queries", expanded=False):
+        st.markdown("""
+        Try these example queries:
+        - "Find frontend developers in London"
+        - "Who are the consultants available in Week 3?"
+        - "Show me Solution Architects in Oslo"
+        - "Find employees with rank above consultant"
+        """)
 
-# Sample queries in an expander
-with st.expander("📝 Sample Queries", expanded=False):
-    st.markdown("""
-    Try these example queries:
-    - "Find frontend developers in London"
-    - "Who are the consultants available in Week 3?"
-    - "Show me Solution Architects in Oslo"
-    - "Find employees with rank above consultant"
-    """)
+with trends_tab:
+    # Display the trends dashboard
+    display_trends_dashboard()
 
 # Add information in the sidebar
 with st.sidebar:
