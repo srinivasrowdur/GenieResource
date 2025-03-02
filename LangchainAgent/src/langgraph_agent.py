@@ -150,7 +150,7 @@ class ReActAgentGraph:
             state = self._get_or_create_state(session_id)
             
             # First, let the agent reason about the query and decide what to do
-            reasoning_prompt = f"""You are Resource Genie, an AI assistant that helps users find resources based on their needs.
+            reasoning_prompt = f'''You are Resource Genie, an AI assistant that helps users find resources based on their needs.
             You have access to a database of employees and their availability information.
             
             Previous context: {state.current_context}
@@ -166,18 +166,44 @@ class ReActAgentGraph:
             4. Do we need to fetch new data or can we use existing data?
             
             Return your analysis as JSON with this structure:
-            {
-                "query_type": "new_search" or "followup",
-                "needs_availability": true/false,
-                "time_period": {
-                    "type": "specific_weeks" or "relative",
-                    "weeks": [list of week numbers] or null,
-                    "relative_reference": "next_month" or "this_month" or "next_week" etc.
-                },
-                "reasoning": "Your step-by-step reasoning here",
+            {{
+                "query_type": "new_search",
+                "needs_availability": false,
+                "time_period": {{
+                    "type": "specific_weeks",
+                    "weeks": [],
+                    "relative_reference": null
+                }},
+                "reasoning": "Explain your reasoning here",
                 "next_action": "What should be done next"
-            }
-            """
+            }}
+            
+            Example for "Are they available next month?":
+            {{
+                "query_type": "followup",
+                "needs_availability": true,
+                "time_period": {{
+                    "type": "relative",
+                    "weeks": [],
+                    "relative_reference": "next_month"
+                }},
+                "reasoning": "This is a follow-up question asking about availability for next month",
+                "next_action": "fetch_availability_data"
+            }}
+            
+            Example for "Check week 2 availability":
+            {{
+                "query_type": "followup",
+                "needs_availability": true,
+                "time_period": {{
+                    "type": "specific_weeks",
+                    "weeks": [2],
+                    "relative_reference": null
+                }},
+                "reasoning": "This is a follow-up question asking about availability for a specific week",
+                "next_action": "fetch_availability_data"
+            }}
+            '''
             
             # Get the agent's analysis
             analysis_messages = [
@@ -272,6 +298,22 @@ class ReActAgentGraph:
                 
                 response = self.model.invoke(messages)
                 response_text = response.content
+                
+                # Calculate execution time
+                execution_time = time.time() - start_time
+                
+                # Cache the response if enabled
+                if self.use_cache:
+                    cache_key = self._generate_cache_key(message)
+                    self._add_to_cache(cache_key, response_text)
+                
+                logger.info(f"Message processed in {execution_time:.2f} seconds")
+                
+                return {
+                    "response": response_text,
+                    "execution_time": execution_time,
+                    "cached": False
+                }
                 
             else:
                 # Handle new search or non-availability query
