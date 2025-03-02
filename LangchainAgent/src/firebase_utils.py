@@ -3,7 +3,7 @@ Firebase utility module for handling Firebase operations.
 """
 
 import os
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from firebase_admin import credentials, initialize_app, firestore, get_app
 import firebase_admin
 import json
@@ -11,6 +11,9 @@ import datetime
 import streamlit as st
 import warnings
 import uuid
+import logging
+
+logger = logging.getLogger(__name__)
 
 class FirebaseClient:
     """
@@ -19,139 +22,148 @@ class FirebaseClient:
     
     def __init__(self, credentials_path: Optional[str] = None):
         """
-        Initialize Firebase client.
+        Initialize the Firebase client.
         
         Args:
-            credentials_path: Path to Firebase credentials JSON file.
-                            If None, will try to:
-                            1. Use Streamlit secrets in production
-                            2. Use FIREBASE_CREDENTIALS_PATH env var
-                            3. Look in common locations
+            credentials_path: Path to the Firebase credentials JSON file. 
+                If None, tries to load from environment variables or Streamlit secrets.
         """
-        self.client = None
-        self.is_demo_mode = False
-        self.is_connected = False
+        self.credentials_path = credentials_path
+        self.db = None
         self.app = None
+        self.is_connected = False
+        self.is_demo_mode = False
         
+        # Check if provided path exists directly (absolute path)
+        if credentials_path and os.path.exists(credentials_path):
+            logger.info(f"Using provided credentials path directly: {credentials_path}")
+            try:
+                # Initialize Firebase with the provided path
+                cred = credentials.Certificate(credentials_path)
+                if not firebase_admin._apps:
+                    self.app = firebase_admin.initialize_app(cred)
+                    logger.info("✅ Created new Firebase app")
+                else:
+                    self.app = firebase_admin.get_app()
+                    logger.info("✅ Using existing Firebase app")
+                
+                # Get the Firestore database
+                self.db = firestore.client()
+                
+                # Test the connection
+                self._test_connection()
+                
+                return
+            except Exception as e:
+                logger.error(f"❌ Error using provided credentials path: {str(e)}")
+                
+        # If direct path didn't work or wasn't provided, proceed with credential lookup
+        if credentials_path and not os.path.exists(credentials_path):
+            logger.warning(f"Credentials file not found at '{credentials_path}'. Will try alternative methods.")
+        
+        # Try to initialize Firebase
         try:
-            # Get the absolute path to the project root directory
-            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            # Get credentials - try multiple sources
+            creds_json = self._get_credentials(credentials_path)
             
-            # Try different paths for credentials
-            possible_paths = [
-                credentials_path,  # Explicitly provided path
-                os.getenv("FIREBASE_CREDENTIALS_PATH"),  # Environment variable
-                os.path.join(project_root, "firebase_credentials.json"),  # Project root
-                os.path.join(os.path.dirname(project_root), "firebase_credentials.json"),  # Parent directory
-                os.path.join(os.path.dirname(project_root), 
-                            "resgenie-e8ab5-firebase-adminsdk-fbsvc-eb9f384590.json"),  # Known filename
-                "firebase_credentials.json"  # Current directory
+            if not creds_json:
+                logger.warning("No Firebase credentials available. Running in demo mode.")
+                self.is_demo_mode = True
+                return
+                
+            # Initialize Firebase with the credentials
+            try:
+                cred = credentials.Certificate(creds_json)
+                if not firebase_admin._apps:
+                    self.app = firebase_admin.initialize_app(cred)
+                    logger.info("✅ Created new Firebase app")
+                else:
+                    self.app = firebase_admin.get_app()
+                    logger.info("✅ Using existing Firebase app")
+                
+                # Get the Firestore database
+                self.db = firestore.client()
+                
+                # Test the connection
+                self._test_connection()
+                
+                logger.info("✅ Firebase initialized successfully")
+                
+            except Exception as e:
+                logger.error(f"❌ Error initializing Firebase: {e}")
+                self.is_connected = False
+                self.is_demo_mode = True
+        
+        except Exception as e:
+            logger.error(f"❌ Error in Firebase client initialization: {e}")
+            self.is_connected = False
+            self.is_demo_mode = True
+    
+    def _get_credentials(self, credentials_path: Optional[str]) -> Union[Dict, str, None]:
+        """
+        Get Firebase credentials from various sources.
+        
+        Args:
+            credentials_path: Path to the credentials file, if provided.
+            
+        Returns:
+            Either a dictionary of credentials, a path to the credentials file,
+            or None if no credentials are available.
+        """
+        # Try Streamlit secrets first
+        try:
+            if hasattr(st, 'secrets') and 'firebase' in st.secrets:
+                logger.info("Using Firebase credentials from Streamlit secrets")
+                return st.secrets.firebase
+            else:
+                logger.warning("⚠️ Unable to access Streamlit secrets: No firebase section found")
+        except Exception as e:
+            logger.warning(f"⚠️ Unable to access Streamlit secrets: {e}")
+        
+        logger.warning("⚠️ Falling back to file-based credentials")
+        
+        # Try environment variables
+        env_path = os.getenv("FIREBASE_CREDENTIALS_PATH")
+        final_path = credentials_path or env_path
+        
+        if not final_path:
+            logger.warning("⚠️ No credentials path provided or found in environment variables")
+            # Look for default paths
+            default_paths = [
+                "firebase_credentials.json",
+                "resgenie-e8ab5-firebase-adminsdk-fbsvc-eb9f384590.json",
+                os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "firebase_credentials.json"),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "firebase_credentials.json"),
+                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "resgenie-e8ab5-firebase-adminsdk-fbsvc-eb9f384590.json")
             ]
             
-            # First try to use Streamlit secrets if available (for production)
-            used_streamlit_secrets = False
-            cred = None
+            for path in default_paths:
+                logger.info(f"🔍 Checking for credentials at: {path}")
+                if os.path.exists(path):
+                    final_path = path
+                    logger.info(f"✅ Found credentials at: {final_path}")
+                    break
             
-            # Try to get credentials from Streamlit secrets
-            # Use a context manager to suppress StreamlitAPIException about missing secrets
+            if not final_path:
+                logger.warning("❌ No Firebase credentials found. Running in demo mode.")
+                return None
+        
+        logger.info(f"🔍 Checking for credentials at: {final_path}")
+        
+        if os.path.exists(final_path):
+            logger.info(f"✅ Found credentials at: {final_path}")
+            logger.info(f"📖 Loading credentials from: {final_path}")
             try:
-                # Check if we're in Streamlit context before attempting to access secrets
-                in_streamlit_context = False
-                try:
-                    # This will fail if we're not in a Streamlit script
-                    _ = st.runtime.exists()
-                    in_streamlit_context = True
-                except:
-                    pass  # Not in a Streamlit context
+                # Two options: return the path or load and return the JSON
+                # Option 1: Return the path (works with firebase_admin)
+                return final_path
                 
-                if in_streamlit_context:
-                    # Try to access secrets, suppressing warnings
-                    with warnings.catch_warnings():
-                        warnings.simplefilter("ignore")
-                        if hasattr(st, 'secrets') and 'firebase' in st.secrets and 'my_project_settings' in st.secrets['firebase']:
-                            print("🔄 Using Streamlit secrets for Firebase configuration...")
-                            firebase_config = st.secrets["firebase"]["my_project_settings"]
-                            
-                            # Convert config to dictionary and validate
-                            config_dict = dict(firebase_config)
-                            
-                            # Validate required fields
-                            required_fields = ["type", "project_id", "private_key_id", "private_key",
-                                            "client_email", "client_id", "auth_uri", "token_uri",
-                                            "auth_provider_x509_cert_url", "client_x509_cert_url"]
-                            
-                            if all(field in config_dict for field in required_fields):
-                                print("✅ Using Firebase configuration from Streamlit secrets")
-                                cred = credentials.Certificate(config_dict)
-                                used_streamlit_secrets = True
-                            else:
-                                missing_fields = [field for field in required_fields if field not in config_dict]
-                                print(f"⚠️ Missing required Firebase fields in Streamlit secrets: {', '.join(missing_fields)}")
-                                print("⚠️ Falling back to file-based credentials")
             except Exception as e:
-                print(f"⚠️ Unable to access Streamlit secrets: {str(e)}")
-                print("⚠️ Falling back to file-based credentials")
-            
-            # Only look for credentials file if Streamlit secrets weren't used
-            if not used_streamlit_secrets:
-                print("⚠️ No Streamlit secrets found or not in a Streamlit context. Using file-based credentials.")
-                # Filter out None values and check each path
-                creds_path = None
-                for path in filter(None, possible_paths):
-                    print(f"🔍 Checking for credentials at: {path}")
-                    if os.path.exists(path):
-                        creds_path = path
-                        print(f"✅ Found credentials at: {path}")
-                        break
-                
-                if not creds_path:
-                    raise ValueError("Firebase credentials file not found in any location and Streamlit secrets not available")
-                
-                # Load and validate credentials
-                print(f"📖 Loading credentials from: {creds_path}")
-                with open(creds_path, 'r') as f:
-                    creds_data = json.load(f)
-                    required_fields = ['type', 'project_id', 'private_key', 'client_email']
-                    missing_fields = [field for field in required_fields if field not in creds_data]
-                    if missing_fields:
-                        raise ValueError(f"Missing required fields in credentials: {', '.join(missing_fields)}")
-                
-                cred = credentials.Certificate(creds_path)
-            
-            # Initialize Firebase
-            print("🔄 Initializing Firebase...")
-            try:
-                self.app = get_app()
-                print("✅ Using existing Firebase app")
-            except ValueError:
-                self.app = initialize_app(cred)
-                print("✅ Created new Firebase app")
-            
-            self.client = firestore.client()
-            self.is_connected = True
-            print("✅ Firebase initialized successfully")
-            
-            # Test connection to both collections
-            try:
-                # Check employees collection
-                self.client.collection('employees').limit(1).get()
-                
-                # Check availability collection
-                self.client.collection('availability').limit(1).get()
-                
-                print("✅ Successfully connected to Firestore and verified collections")
-            except Exception as e:
-                raise Exception(f"Failed to connect to Firestore collections: {str(e)}")
-            
-        except Exception as e:
-            print(f"❌ Firebase initialization failed: {str(e)}")
-            # Print environment info for debugging
-            print("\n🔧 Debug Information:")
-            print(f"Current working directory: {os.getcwd()}")
-            print(f"Project root directory: {project_root}")
-            print(f"FIREBASE_CREDENTIALS_PATH: {os.getenv('FIREBASE_CREDENTIALS_PATH')}")
-            # Raise error instead of enabling demo mode
-            raise Exception(f"Firebase initialization failed: {str(e)}")
+                logger.error(f"❌ Error loading credentials file: {e}")
+                return None
+        else:
+            logger.warning(f"❌ Credentials file not found at: {final_path}")
+            return None
     
     def query_resources(self, filters: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
@@ -194,7 +206,7 @@ class FirebaseClient:
             print(f"Debug: Querying employees with filters: {employee_filters}")
             
             # Step 1: Query employees collection
-            query = self.client.collection('employees')
+            query = self.db.collection('employees')
             
             # Apply filters optimally
             for field, value in employee_filters.items():
@@ -249,7 +261,7 @@ class FirebaseClient:
                     
                     for emp_num in batch_employees:
                         # Get availability document
-                        avail_doc = self.client.collection('availability').document(emp_num).get()
+                        avail_doc = self.db.collection('availability').document(emp_num).get()
                         if not avail_doc.exists:
                             continue
                         
@@ -331,7 +343,7 @@ class FirebaseClient:
                     continue
                     
                 # Get availability document
-                avail_doc = self.client.collection('availability').document(employee_number).get()
+                avail_doc = self.db.collection('availability').document(employee_number).get()
                 if not avail_doc.exists:
                     continue
                     
@@ -390,13 +402,13 @@ class FirebaseClient:
             employee_data = None
             
             # First try direct document lookup by ID
-            doc = self.client.collection('employees').document(resource_id).get()
+            doc = self.db.collection('employees').document(resource_id).get()
             if doc.exists:
                 employee_data = doc.to_dict()
                 employee_data['id'] = doc.id
             else:
                 # If not found, try to query by employee_number
-                query = (self.client.collection('employees')
+                query = (self.db.collection('employees')
                         .filter("employee_number", "==", resource_id)
                         .limit(1))
                 results = list(query.stream())
@@ -414,7 +426,7 @@ class FirebaseClient:
                     target_weeks = set(range(current_week, current_week + 4))
                     
                     # Get availability document
-                    avail_doc = self.client.collection('availability').document(employee_number).get()
+                    avail_doc = self.db.collection('availability').document(employee_number).get()
                     if avail_doc.exists:
                         # Get weeks subcollection
                         weeks_ref = avail_doc.reference.collection('weeks')
@@ -494,7 +506,7 @@ class FirebaseClient:
                 return verification
             
             # Test querying the employees collection
-            employees_query = self.client.collection('employees').limit(5)
+            employees_query = self.db.collection('employees').limit(5)
             employee_docs = list(employees_query.stream())
             employee_count = len(employee_docs)
             verification['employee_count'] = employee_count
@@ -520,7 +532,7 @@ class FirebaseClient:
                 return verification
             
             # Check availability collection
-            avail_query = self.client.collection('availability').limit(5)
+            avail_query = self.db.collection('availability').limit(5)
             avail_docs = list(avail_query.stream())
             avail_count = len(avail_docs)
             verification['availability_count'] = avail_count
@@ -593,7 +605,7 @@ class FirebaseClient:
             ranks = set()
             
             # Get a reference to the employees collection
-            employees_ref = self.client.collection('employees')
+            employees_ref = self.db.collection('employees')
             employees = employees_ref.limit(100).stream()  # Limit to prevent large data loads
             
             # Collect metadata from employees
@@ -651,7 +663,7 @@ class FirebaseClient:
             print(f"Input filters: locations={locations}, ranks={ranks}, skills={skills}, weeks={weeks}")
             
             # Start with the employees collection
-            query = self.client.collection('employees')
+            query = self.db.collection('employees')
             print("Base query created")
             
             # Apply location filter
@@ -784,7 +796,7 @@ class FirebaseClient:
                 print("No partners found with current location filter, trying to find any partners...")
                 
                 # Try a broader search just for partners regardless of location
-                partner_query = self.client.collection('employees')
+                partner_query = self.db.collection('employees')
                 partner_docs = list(partner_query.get())
                 
                 partner_list = []
@@ -976,7 +988,7 @@ class FirebaseClient:
                     continue
                     
                 # Get reference to availability document
-                availability_ref = self.client.collection('availability').document(emp_id)
+                availability_ref = self.db.collection('availability').document(emp_id)
                 
                 # Query the weeks subcollection
                 weeks_query = availability_ref.collection('weeks')
@@ -1036,7 +1048,7 @@ class FirebaseClient:
                 return False
                 
             # Create a new document in the queries collection
-            query_ref = self.client.collection('queries').document()
+            query_ref = self.db.collection('queries').document()
             
             # Extract tags from metadata
             tags = []
@@ -1083,4 +1095,284 @@ class FirebaseClient:
             print(f"❌ Error saving query data: {str(e)}")
             import traceback
             traceback.print_exc()
-            return False 
+            return False
+    
+    def get_all_queries(self, limit: int = 500) -> List[Dict[str, Any]]:
+        """
+        Fetch all query data from the 'queries' collection for analytics.
+        
+        Args:
+            limit: Maximum number of queries to return (default: 500)
+            
+        Returns:
+            List of dictionaries containing query data
+        """
+        try:
+            if not self.is_connected:
+                print("Cannot fetch query data: Firebase client is not connected")
+                return []
+                
+            # Query the 'queries' collection
+            query_ref = (
+                self.db.collection('queries')
+                .order_by('timestamp', direction=firestore.Query.DESCENDING)
+                .limit(limit)
+            )
+            
+            # Execute the query and get documents
+            docs = query_ref.stream()
+            
+            # Convert documents to dictionaries
+            results = []
+            for doc in docs:
+                data = doc.to_dict()
+                data['id'] = doc.id  # Add document ID
+                results.append(data)
+                
+            return results
+            
+        except Exception as e:
+            print(f"Error fetching query data: {str(e)}")
+            return []
+    
+    def get_resources(self, locations: List[str] = None, skills: List[str] = None, ranks: List[str] = None, collection: str = 'resources', nested_ranks: bool = False) -> List[Dict[str, Any]]:
+        """
+        Get resources matching the specified criteria.
+        
+        Args:
+            locations: List of locations to filter by
+            skills: List of skills to filter by
+            ranks: List of ranks/positions to filter by
+            collection: Collection name to query ('resources' or 'employees')
+            nested_ranks: Whether ranks are stored as nested objects with 'official_name' field
+            
+        Returns:
+            List of resources matching the criteria
+        """
+        # If we're in demo mode or not connected, return sample data
+        if self.is_demo_mode or not self.is_connected:
+            logger.warning("Not connected to Firebase or in demo mode - returning sample data")
+            return self._get_sample_resources(locations, skills, ranks)
+        
+        try:
+            logger.info(f"Querying real Firebase database with locations={locations}, skills={skills}, ranks={ranks}")
+            logger.info(f"Using collection: {collection}, nested_ranks={nested_ranks}")
+            
+            # Start with the collection
+            query = self.db.collection(collection)
+            
+            # Add filters based on provided criteria
+            # Location filter
+            if locations and len(locations) > 0:
+                if len(locations) == 1:
+                    # Use == for single location (more efficient)
+                    query = query.where('location', '==', locations[0])
+                else:
+                    # Use 'in' for multiple locations (if supported)
+                    try:
+                        query = query.where('location', 'in', locations)
+                    except Exception:
+                        logger.warning("'in' operator not supported for location, using Python filtering instead")
+                        # We'll filter in Python below
+            
+            # For nested ranks, we can't directly query with Firestore, so we'll filter in Python
+            
+            # Get the results
+            docs = query.get()
+            logger.info(f"Query returned {len(docs)} documents from Firebase")
+            
+            # Convert to list of dictionaries and apply Python-side filtering
+            results = []
+            for doc in docs:
+                resource = doc.to_dict()
+                resource['id'] = doc.id
+                
+                # Python-side filtering for location if needed
+                if locations and len(locations) > 0:
+                    resource_location = resource.get('location', '').lower()
+                    if not any(loc.lower() == resource_location for loc in locations):
+                        continue
+                
+                # Python-side filtering for rank - handle both nested and non-nested formats
+                if ranks and len(ranks) > 0:
+                    # Get rank from the resource
+                    resource_rank = resource.get('rank', '')
+                    
+                    # For nested ranks structure (like in the employees collection where rank is an object)
+                    if nested_ranks and isinstance(resource_rank, dict):
+                        # Extract the official_name from the rank object
+                        official_name = resource_rank.get('official_name', '')
+                        
+                        # Do an EXACT match to rank names (not partial match)
+                        # This ensures "Partner" doesn't match "Associate Partner"
+                        if not any(rank.lower() == official_name.lower() for rank in ranks):
+                            continue
+                    # For string ranks (simple string comparison)
+                    elif isinstance(resource_rank, str):
+                        if not any(rank.lower() == resource_rank.lower() for rank in ranks):
+                            continue
+                    # Unknown rank format, skip this filter
+                    else:
+                        logger.warning(f"Unknown rank format: {resource_rank}")
+                
+                # For skills, filter in Python regardless of collection
+                if skills and len(skills) > 0:
+                    # Handle both list and possibly nested skills
+                    resource_skills = resource.get('skills', [])
+                    
+                    # If skills is a list of strings, do direct comparison
+                    if isinstance(resource_skills, list) and all(isinstance(s, str) for s in resource_skills):
+                        resource_skills_lower = [s.lower() for s in resource_skills]
+                        if not any(skill.lower() in resource_skills_lower for skill in skills):
+                            continue
+                    # If skills format is unknown, try our best
+                    else:
+                        # Convert to string and do simple text matching
+                        skills_str = str(resource_skills).lower()
+                        if not any(skill.lower() in skills_str for skill in skills):
+                            continue
+                
+                # If we passed all filters, add to results
+                results.append(resource)
+            
+            # Log the number of results after all filtering
+            logger.info(f"After filtering: found {len(results)} matching resources")
+            
+            # Log a few resource details for debugging
+            for i, resource in enumerate(results[:3]):
+                # For nested ranks, show the official_name
+                if nested_ranks and isinstance(resource.get('rank'), dict):
+                    rank_display = resource.get('rank', {}).get('official_name', 'Unknown')
+                else:
+                    rank_display = resource.get('rank', 'Unknown')
+                    
+                logger.info(f"Result {i+1}: {resource.get('name', 'Unknown')} - {rank_display} in {resource.get('location', 'Unknown')}")
+                
+            if len(results) > 3:
+                logger.info(f"...and {len(results) - 3} more resources")
+                
+            return results
+            
+        except Exception as e:
+            logger.error(f"Error getting resources: {e}")
+            logger.error(f"Falling back to sample data")
+            return self._get_sample_resources(locations, skills, ranks)
+    
+    def _get_sample_resources(self, locations=None, skills=None, ranks=None) -> List[Dict[str, Any]]:
+        """
+        Generate sample resource data for demo mode.
+        
+        Args:
+            locations: List of locations to filter by
+            skills: List of skills to filter by
+            ranks: List of ranks to filter by
+            
+        Returns:
+            List of sample resources
+        """
+        # Sample data
+        resources = [
+            {
+                "id": "r1",
+                "name": "John Smith",
+                "location": "London",
+                "skills": ["Python", "JavaScript", "Cloud"],
+                "rank": "Senior Consultant",
+                "availability": "Available"
+            },
+            {
+                "id": "r2",
+                "name": "Sarah Johnson",
+                "location": "Manchester",
+                "skills": ["Java", "DevOps", "AI"],
+                "rank": "Consultant",
+                "availability": "Available Next Month"
+            },
+            {
+                "id": "r3",
+                "name": "David Williams",
+                "location": "Edinburgh",
+                "skills": ["Python", "ML", "Frontend"],
+                "rank": "Manager",
+                "availability": "Available"
+            },
+            {
+                "id": "r4",
+                "name": "Emily Brown",
+                "location": "London",
+                "skills": ["JavaScript", "Frontend", "UX"],
+                "rank": "Analyst",
+                "availability": "Available"
+            },
+            {
+                "id": "r5",
+                "name": "Michael Taylor",
+                "location": "Manchester",
+                "skills": ["Java", "Backend", "Cloud"],
+                "rank": "Principal Consultant",
+                "availability": "Available"
+            },
+            {
+                "id": "r6",
+                "name": "Richard Johnson",
+                "location": "Manchester",
+                "skills": ["Strategy", "Leadership", "Finance"],
+                "rank": "Partner",
+                "availability": "Limited Availability"
+            }
+        ]
+        
+        # Apply filters if provided
+        filtered_resources = resources
+        
+        if locations and len(locations) > 0:
+            locations = [loc.lower() for loc in locations]
+            filtered_resources = [r for r in filtered_resources if r['location'].lower() in locations]
+        
+        if skills and len(skills) > 0:
+            skills = [skill.lower() for skill in skills]
+            filtered_resources = [
+                r for r in filtered_resources 
+                if any(skill.lower() in [s.lower() for s in r['skills']] for skill in skills)
+            ]
+        
+        if ranks and len(ranks) > 0:
+            ranks = [rank.lower() for rank in ranks]
+            filtered_resources = [r for r in filtered_resources if r['rank'].lower() in ranks]
+        
+        return filtered_resources
+    
+    def _test_connection(self):
+        """Test the connection to Firestore and verify collection access."""
+        try:
+            # Check if Firestore client is initialized
+            if not self.db:
+                logger.error("❌ Firestore client not initialized")
+                self.is_connected = False
+                return
+                
+            # Check access to common collection names
+            collection_names = ['resources', 'employees', 'queries', 'availability']
+            connected_to_any = False
+            
+            for collection_name in collection_names:
+                try:
+                    # Just check if we can access the collection - get one document if any exist
+                    docs = self.db.collection(collection_name).limit(1).get()
+                    # Access the result to ensure the query executes
+                    list(docs)
+                    logger.info(f"✅ Successfully connected to '{collection_name}' collection")
+                    connected_to_any = True
+                except Exception as e:
+                    logger.warning(f"⚠️ Collection '{collection_name}' not accessible: {e}")
+            
+            self.is_connected = connected_to_any
+            
+            if self.is_connected:
+                logger.info("✅ Successfully connected to Firestore and verified collections")
+            else:
+                logger.warning("⚠️ Could not access any expected collections")
+            
+        except Exception as e:
+            logger.error(f"❌ Error testing Firestore connection: {e}")
+            self.is_connected = False 
