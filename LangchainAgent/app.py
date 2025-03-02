@@ -4,11 +4,15 @@ Resource Management Agent - Streamlit UI
 
 import streamlit as st
 import os
+from dotenv import load_dotenv
 from src.master_agent import MasterAgent
 from src.query_translator import QueryTranslator
 from src.resource_fetcher import ResourceFetcher
 from src.response_generator import ResponseGenerator
 from src.firebase_utils import FirebaseClient
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Set page config - must be the first Streamlit command
 st.set_page_config(
@@ -27,11 +31,18 @@ if "firebase_client" not in st.session_state:
 
 # Check for required environment variables
 anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+# Try to get the API key from Streamlit secrets if not in environment variables
+if not anthropic_api_key and 'ANTHROPIC_API_KEY' in st.secrets:
+    anthropic_api_key = st.secrets['ANTHROPIC_API_KEY']
+
 firebase_creds_path = os.getenv("FIREBASE_CREDENTIALS_PATH")
+# Try to get the credentials path from Streamlit secrets if not in environment variables
+if not firebase_creds_path and 'FIREBASE_CREDENTIALS_PATH' in st.secrets:
+    firebase_creds_path = st.secrets['FIREBASE_CREDENTIALS_PATH']
 
 if not anthropic_api_key:
-    st.error("⚠️ ANTHROPIC_API_KEY not found in environment variables.")
-    st.info("Please set your ANTHROPIC_API_KEY environment variable.")
+    st.error("⚠️ ANTHROPIC_API_KEY not found in environment variables or Streamlit secrets.")
+    st.info("Please set your ANTHROPIC_API_KEY environment variable or add it to your Streamlit secrets.")
     st.stop()
 
 # Initialize Firebase only once if not already initialized
@@ -139,10 +150,13 @@ if st.session_state.firebase_client is None:
 def initialize_agent():
     """Initialize the agent with all required components."""
     try:
-        # Get API key
+        # Get API key from environment variables or Streamlit secrets
         anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not anthropic_api_key and 'ANTHROPIC_API_KEY' in st.secrets:
+            anthropic_api_key = st.secrets['ANTHROPIC_API_KEY']
+            
         if not anthropic_api_key:
-            raise ValueError("ANTHROPIC_API_KEY not found in environment variables")
+            raise ValueError("ANTHROPIC_API_KEY not found in environment variables or Streamlit secrets")
         
         # Check Firebase connection
         if not st.session_state.firebase_client or not st.session_state.firebase_client.is_connected:

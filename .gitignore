@@ -1,5 +1,6 @@
 # Credentials and sensitive files
 *credentials*.json
+resgenie-e8ab5-firebase-adminsdk-fbsvc-eb9f384590.json
 *.env
 .env
 .streamlit/secrets.toml
