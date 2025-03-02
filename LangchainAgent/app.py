@@ -54,7 +54,7 @@ if st.session_state.firebase_client is None:
         verification = st.session_state.firebase_client.verify_firebase_setup()
         
         if verification['employees_exist'] and verification['availability_exist']:
-            st.sidebar.success(f"✅ Connected to Firebase with {verification['employee_count']} employees")
+            pass  # Success message removed
         elif verification['employees_exist']:
             st.warning(f"⚠️ {verification['message']}")
             st.info("""
