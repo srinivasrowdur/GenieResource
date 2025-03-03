@@ -1,5 +1,5 @@
 """
-LangGraph Agent implementation for Resource Genie
+LangGraph Agent implementation for Resource Genie using function calling and workflows.
 
 This module implements a very simple agent using LangGraph to avoid compatibility issues.
 """
@@ -8,26 +8,175 @@ import os
 import time
 import json
 import logging
-from typing import Dict, List, Any, Optional, TypedDict, Union, Tuple
+from typing import Dict, List, Any, Optional, TypedDict, Union, Tuple, Literal
 from datetime import datetime
 import uuid
 import hashlib
+import random
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.language_models import BaseChatModel
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.tools import Tool, tool
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+from langgraph.prebuilt import create_react_agent
+from pydantic import BaseModel, Field
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Response schema
-class AgentResponse(TypedDict):
-    response: str
-    execution_time: Optional[float]
-    cached: bool
+# Define schema models
+class TimeRange(BaseModel):
+    type: Literal["specific_weeks", "relative"]
+    weeks: List[int] = Field(description="List of week numbers between 1-52")
+    relative_reference: Optional[Literal["next_month", "this_month", "next_week"]] = None
+    reasoning: str
 
-# Define cache entry structure
+class LocationInfo(BaseModel):
+    mentioned: List[str] = Field(description="Locations as mentioned in query")
+    resolved: List[str] = Field(description="Actual database locations")
+    reasoning: str
+
+class QueryAnalysis(BaseModel):
+    query_type: Literal["new_search", "followup"]
+    needs_availability: bool
+    time_period: TimeRange
+    locations: LocationInfo
+    reasoning: str
+    next_action: Literal["search_resources", "fetch_availability", "use_previous_results"]
+
+class SearchParams(BaseModel):
+    locations: List[str]
+    skills: List[str]
+    ranks: List[str]
+    validation_notes: str
+
+class AgentState(BaseModel):
+    """State management for the ReAct agent."""
+    session_id: str
+    current_message: str
+    previous_results: List[dict] = Field(default_factory=list)
+    current_context: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Optional[Dict[str, Any]] = None
+    analysis: Optional[QueryAnalysis] = None
+    search_params: Optional[SearchParams] = None
+    resources: Optional[List[dict]] = None
+    availability_data: Optional[Dict[str, List[dict]]] = None
+    final_response: Optional[str] = None
+    error: Optional[str] = None
+
+# Define function schemas
+FUNCTION_SCHEMAS = {
+    "analyze_query": {
+        "name": "analyze_query",
+        "description": "Analyze a user query about resources",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query_type": {
+                    "type": "string",
+                    "enum": ["new_search", "followup"],
+                    "description": "Type of the query"
+                },
+                "needs_availability": {
+                    "type": "boolean",
+                    "description": "Whether availability check is needed"
+                },
+                "time_period": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "enum": ["specific_weeks", "relative"]},
+                        "weeks": {
+                            "type": "array",
+                            "items": {"type": "integer", "minimum": 1, "maximum": 52}
+                        },
+                        "relative_reference": {
+                            "type": "string",
+                            "enum": ["next_month", "this_month", "next_week", None]
+                        },
+                        "reasoning": {"type": "string"}
+                    },
+                    "required": ["type", "weeks", "reasoning"]
+                },
+                "locations": {
+                    "type": "object",
+                    "properties": {
+                        "mentioned": {"type": "array", "items": {"type": "string"}},
+                        "resolved": {"type": "array", "items": {"type": "string"}},
+                        "reasoning": {"type": "string"}
+                    },
+                    "required": ["mentioned", "resolved", "reasoning"]
+                },
+                "reasoning": {"type": "string"},
+                "next_action": {
+                    "type": "string",
+                    "enum": ["search_resources", "fetch_availability", "use_previous_results"]
+                }
+            },
+            "required": ["query_type", "needs_availability", "time_period", "locations", "reasoning", "next_action"]
+        }
+    },
+    "validate_params": {
+        "name": "validate_params",
+        "description": "Validate search parameters against database values",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "skills": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Valid skills from the database"
+                },
+                "ranks": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Valid ranks from the database"
+                },
+                "validation_notes": {
+                    "type": "string",
+                    "description": "Notes about parameter validation"
+                }
+            },
+            "required": ["skills", "ranks", "validation_notes"]
+        }
+    }
+}
+
+def get_database_metadata() -> Dict[str, Any]:
+    """Get metadata from Firebase."""
+    try:
+        if not hasattr(get_database_metadata, 'metadata'):
+            # Cache metadata
+            get_database_metadata.metadata = {
+                "locations": [
+                    "Manchester", "London", "Oslo", "Stockholm",
+                    "Copenhagen", "Belfast", "Bristol"
+                ],
+                "skills": [
+                    "DevOps Engineer", "Data Engineer", "Business Analyst",
+                    "Scrum Master", "Frontend Developer", "Backend Developer",
+                    "Full Stack Developer", "Agile Coach", "Cloud Engineer",
+                    "UX Designer", "Project Manager", "Product Owner",
+                    "Python", "Java", "JavaScript", ".NET"
+                ],
+                "ranks": [
+                    "Partner", "Associate Partner", "Consulting Director",
+                    "Principal Consultant", "Managing Consultant", "Senior Consultant",
+                    "Consultant", "Consultant Analyst", "Analyst"
+                ],
+                "region_mappings": {
+                    "Nordics": ["Oslo", "Stockholm", "Copenhagen"],
+                    "UK": ["London", "Manchester", "Belfast", "Bristol"]
+                }
+            }
+        return get_database_metadata.metadata
+    except Exception as e:
+        logger.error(f"Error getting metadata: {e}")
+        return {}
+
+# Cache entry structure
 class CacheEntry:
     def __init__(self, response: str, timestamp: float, ttl: int = 3600):
         self.response = response
@@ -38,24 +187,338 @@ class CacheEntry:
         """Check if the cache entry is still valid."""
         return time.time() - self.timestamp < self.ttl
 
-# Add state management class
-class AgentState:
-    """State management for the ReAct agent."""
-    def __init__(self):
-        self.previous_results = []  # Store previous query results
-        self.current_context = {}   # Store current conversation context
-        self.last_query = None      # Store last query parameters
-        self.conversation_history = []  # Store conversation history
-        self.metadata = None  # Store database metadata
+# Node functions for the workflow
+def analyze_query(state: AgentState, model: BaseChatModel) -> AgentState:
+    """Analyze the query and decide next action."""
+    max_retries = 5  # Increased from 3
+    base_delay = 1  # Base delay in seconds
+    
+    def parse_json_response(content: str) -> dict:
+        """Parse and validate JSON from LLM response."""
+        try:
+            # First try to find JSON between triple backticks
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            else:
+                # If no code blocks, try to find JSON between curly braces
+                start_idx = content.find('{')
+                end_idx = content.rfind('}')
+                if start_idx != -1 and end_idx != -1:
+                    content = content[start_idx:end_idx + 1].strip()
+            
+            # Remove any trailing or leading text
+            content = content.strip()
+            if not content.startswith('{'):
+                raise ValueError("No valid JSON object found in response")
+            
+            parsed = json.loads(content)
+            logger.info(f"Successfully parsed JSON structure with keys: {list(parsed.keys())}")
+            return parsed
+        except Exception as e:
+            logger.error(f"Error parsing JSON response: {e}")
+            logger.error(f"Raw content: {content}")
+            raise
+    
+    for attempt in range(max_retries):
+        try:
+            # Update metadata if needed
+            if not state.metadata:
+                state.metadata = get_database_metadata()
 
-    def update_metadata(self, metadata: dict):
-        """Update metadata from database"""
-        self.metadata = metadata
+            # Calculate exponential backoff with jitter
+            delay = min(300, base_delay * (2 ** attempt))  # Cap at 5 minutes
+            jitter = random.uniform(0, 0.1 * delay)  # 10% jitter
+            total_delay = delay + jitter
 
-# Main agent class
+            if attempt > 0:
+                logger.info(f"Retry attempt {attempt + 1}/{max_retries} with {total_delay:.2f}s delay")
+                time.sleep(total_delay)
+
+            # Analyze query using function calling
+            messages = [
+                SystemMessage(content="""You are Resource Genie, analyzing queries about resource management.
+                Your task is to analyze the query and return a JSON object with the following structure:
+                {
+                    "query_type": "new_search" or "followup",
+                    "needs_availability": boolean,
+                    "time_period": {
+                        "type": "specific_weeks" or "relative",
+                        "weeks": [list of integers 1-52],
+                        "reasoning": "explanation"
+                    },
+                    "locations": {
+                        "mentioned": ["list of locations"],
+                        "resolved": ["list of actual locations"],
+                        "reasoning": "explanation"
+                    },
+                    "reasoning": "overall analysis",
+                    "next_action": "search_resources" or "fetch_availability" or "use_previous_results"
+                }
+                
+                Use ONLY these values:
+                - Locations: Manchester, London, Oslo, Stockholm, Copenhagen, Belfast, Bristol
+                - Region mappings:
+                  * Nordics -> Oslo, Stockholm, Copenhagen
+                  * UK -> London, Manchester, Belfast, Bristol"""),
+                HumanMessage(content=f"""
+                Current date: {datetime.now().strftime("%Y-%m-%d")}
+                Current week: {datetime.now().isocalendar()[1]}
+                Previous context: {state.current_context}
+                Previous results: {len(state.previous_results)} resources
+                
+                Query: {state.current_message}
+                """)
+            ]
+
+            logger.info(f"Attempt {attempt + 1}/{max_retries} to analyze query")
+            response = model.invoke(messages)
+            
+            try:
+                # First try to get function call
+                if hasattr(response, 'additional_kwargs') and 'function_call' in response.additional_kwargs:
+                    function_args = json.loads(response.additional_kwargs["function_call"]["arguments"])
+                    logger.info("Successfully extracted analysis from function call")
+                else:
+                    # Try to extract JSON from response content
+                    function_args = parse_json_response(response.content)
+                    logger.info("Successfully extracted analysis from response content")
+                
+                analysis = QueryAnalysis.parse_obj(function_args)
+                state.analysis = analysis
+                logger.info(f"Query analysis: {analysis.dict()}")
+                return state
+                
+            except Exception as e:
+                logger.error(f"Failed to parse response: {e}")
+                if attempt < max_retries - 1:
+                    continue
+                state.error = "Failed to analyze query: Could not parse response"
+                return state
+                
+        except Exception as e:
+            logger.error(f"Error in analyze_query attempt {attempt + 1}: {str(e)}", exc_info=True)
+            if attempt < max_retries - 1:
+                continue
+            state.error = f"Error in query analysis after {max_retries} attempts: {str(e)}"
+            return state
+
+    return state
+
+def validate_search_params(state: AgentState, model: BaseChatModel) -> AgentState:
+    """Validate and prepare search parameters."""
+    def parse_json_response(content: str) -> dict:
+        """Parse and validate JSON from LLM response."""
+        try:
+            # First try to find JSON between triple backticks
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            else:
+                # If no code blocks, try to find JSON between curly braces
+                start_idx = content.find('{')
+                end_idx = content.rfind('}')
+                if start_idx != -1 and end_idx != -1:
+                    content = content[start_idx:end_idx + 1].strip()
+            
+            parsed = json.loads(content)
+            logger.info(f"Successfully parsed JSON structure with keys: {list(parsed.keys())}")
+            return parsed
+        except Exception as e:
+            logger.error(f"Error parsing JSON response: {e}")
+            logger.error(f"Raw content: {content}")
+            raise
+
+    try:
+        if not state.analysis:
+            state.error = "No query analysis available"
+            return state
+
+        # Get valid parameters from metadata
+        valid_params = {
+            "locations": state.metadata.get("locations", []),
+            "skills": state.metadata.get("skills", []),
+            "ranks": state.metadata.get("ranks", [])
+        }
+
+        # Use function calling to validate parameters
+        messages = [
+            SystemMessage(content="""You are a parameter validator for database queries.
+            Your task is to extract and validate search parameters that EXACTLY match our database values.
+            You must return a JSON object with the following structure:
+            {
+                "locations": ["list of valid locations"],
+                "skills": ["list of valid skills"],
+                "ranks": ["list of valid ranks"],
+                "validation_notes": "explanation of validation decisions"
+            }
+            
+            IMPORTANT:
+            - Only use values from the provided valid parameter lists
+            - Invalid values will be ignored
+            - Lists can be empty if no valid values found
+            - For queries about "Partners", always include "Partner" in ranks
+            - Always include validation_notes explaining your decisions"""),
+            HumanMessage(content=f"""
+            Valid parameters:
+            {json.dumps(valid_params, indent=2)}
+            
+            Query analysis:
+            {state.analysis.dict()}
+            
+            Current message:
+            {state.current_message}
+            
+            Extract and validate the parameters, ensuring they match the database values exactly.
+            If the query mentions "Partners", make sure to include "Partner" in the ranks list.
+            """)
+        ]
+
+        response = model.invoke(messages)
+        
+        try:
+            # First try to get function call
+            if hasattr(response, 'additional_kwargs') and 'function_call' in response.additional_kwargs:
+                params_dict = json.loads(response.additional_kwargs["function_call"]["arguments"])
+                logger.info("Successfully extracted parameters from function call")
+            else:
+                # Try to extract JSON from response content
+                params_dict = parse_json_response(response.content)
+                logger.info("Successfully extracted parameters from response content")
+            
+            # Ensure "Partner" is included if query is about partners
+            if "partner" in state.current_message.lower() and "Partner" not in params_dict.get("ranks", []):
+                params_dict["ranks"] = ["Partner"]
+                params_dict["validation_notes"] = "Added Partner rank based on query context. " + params_dict.get("validation_notes", "")
+            
+            # Create SearchParams object
+            params = SearchParams(
+                locations=params_dict.get("locations", []),
+                skills=params_dict.get("skills", []),
+                ranks=params_dict.get("ranks", []),
+                validation_notes=params_dict.get("validation_notes", "")
+            )
+            
+            state.search_params = params
+            logger.info(f"Validated parameters: {params.dict()}")
+            return state
+            
+        except Exception as e:
+            logger.error(f"Failed to parse validation response: {e}")
+            state.error = f"Failed to validate parameters: {str(e)}"
+            return state
+
+    except Exception as e:
+        state.error = f"Error in parameter validation: {str(e)}"
+        return state
+
+def search_resources(state: AgentState, firebase_client: Any) -> AgentState:
+    """Search for resources using validated parameters."""
+    try:
+        if not state.search_params:
+            state.error = "No search parameters available"
+            return state
+
+        # Execute search with validated parameters
+        resources = firebase_client.get_resources(
+            locations=state.search_params.locations,
+            skills=state.search_params.skills,
+            ranks=state.search_params.ranks,
+            collection='employees',
+            nested_ranks=True
+        )
+
+        state.resources = resources
+        logger.info(f"Found {len(resources)} resources")
+        return state
+    except Exception as e:
+        state.error = f"Error in resource search: {str(e)}"
+        return state
+
+def check_availability(state: AgentState, firebase_client: Any) -> AgentState:
+    """Check availability for resources."""
+    try:
+        # Get filtered results from current context if available
+        filtered_results = state.current_context.get('filtered_results', [])
+        
+        # For follow-up queries, use filtered results from context, then fall back to current resources
+        resources_to_check = filtered_results if filtered_results else state.resources
+        
+        if not resources_to_check:
+            state.error = "No resources found to check availability for"
+            return state
+        
+        if not state.analysis or not state.analysis.time_period.weeks:
+            state.error = "Missing required data for availability check"
+            return state
+
+        logger.info(f"Checking availability for {len(resources_to_check)} resources")
+
+        # Validate employee numbers and weeks
+        employee_numbers = [
+            str(r.get('employee_number')) 
+            for r in resources_to_check 
+            if r.get('employee_number') and str(r.get('employee_number')).startswith('EMP')
+        ]
+
+        valid_weeks = [
+            w for w in state.analysis.time_period.weeks 
+            if isinstance(w, int) and 1 <= w <= 52
+        ]
+
+        if not valid_weeks:
+            logger.warning(f"No valid week numbers found in: {state.analysis.time_period.weeks}")
+            state.error = "No valid week numbers provided"
+            return state
+
+        if not employee_numbers:
+            logger.warning("No valid employee numbers found")
+            state.error = "No valid employee numbers found"
+            return state
+
+        # Fetch availability data
+        availability = firebase_client._fetch_availability_batch(
+            employee_numbers=employee_numbers,
+            weeks=valid_weeks
+        )
+
+        state.availability_data = availability
+        state.resources = resources_to_check  # Keep the filtered resources for response
+        logger.info(f"Fetched availability for {len(employee_numbers)} employees in weeks {valid_weeks}")
+        return state
+    except Exception as e:
+        state.error = f"Error in availability check: {str(e)}"
+        return state
+
+def generate_response(state: AgentState, model: BaseChatModel) -> AgentState:
+    """Generate final response based on collected data."""
+    try:
+        # Prepare context for response generation
+        context = {
+            "analysis": state.analysis.dict() if state.analysis else None,
+            "resources": state.resources,
+            "availability": state.availability_data,
+            "query": state.current_message
+        }
+
+        # Generate response using function calling
+        response = model.invoke([
+            SystemMessage(content="""You are Resource Genie, providing helpful responses about resources.
+            Generate a clear and informative response based on the available data."""),
+            HumanMessage(content=f"Context: {json.dumps(context, indent=2)}")
+        ])
+
+        state.final_response = response.content
+        return state
+    except Exception as e:
+        state.error = f"Error in response generation: {str(e)}"
+        return state
+
 class ReActAgentGraph:
     """
-    A simple implementation of an agent that processes resource queries.
+    Implementation of Resource Genie using LangGraph's ReAct agent pattern.
     """
     
     def __init__(
@@ -66,246 +529,130 @@ class ReActAgentGraph:
         cache_ttl: int = 3600,
         verbose: bool = False
     ):
-        """
-        Initialize the ReActAgentGraph.
-        
-        Args:
-            model: The language model to use for the agent.
-            firebase_client: Firebase client for resource management.
-            use_cache: Whether to use caching for responses.
-            cache_ttl: Time to live (in seconds) for cached responses.
-            verbose: Whether to enable verbose logging.
-        """
         self.model = model
         self.firebase_client = firebase_client
         self.use_cache = use_cache
         self.cache_ttl = cache_ttl
         self.verbose = verbose
         
-        # Cache management
-        self._response_cache = {}
-        self._cache_hits = 0
-        self._cache_misses = 0
+        # Initialize tools
+        self.tools = self._create_tools()
         
-        # Session management - simple dictionary
-        self._sessions = {}
+        # Initialize memory for state persistence
+        self.checkpointer = MemorySaver()
         
-        # System prompt for resource queries
-        self.system_prompt = """You are Resource Genie, an AI assistant that helps users find resources based on their needs.
+        # Create ReAct agent
+        self.agent = create_react_agent(
+            self.model,
+            self.tools,
+            checkpointer=self.checkpointer
+        )
         
-        When a user asks about finding resources, try to identify:
-        1. Locations mentioned (e.g., London, Manchester, Edinburgh)
-        2. Skills mentioned (e.g., Python, Java, frontend, backend)
-        3. Ranks or positions mentioned (e.g., Analyst, Consultant, Manager)
-        
-        If the user is looking for resources, respond in a helpful, conversational way.
-        If the request isn't about resources, respond as a helpful assistant.
-        """
-        
-        # Add state management
-        self._state = {}  # Dictionary to store state per session
-        
-        logger.info("ReActAgentGraph initialized successfully")
+        logger.info("ReActAgentGraph initialized with ReAct agent pattern")
 
-    def _get_or_create_state(self, session_id: str) -> AgentState:
-        """Get or create state for a session."""
-        if session_id not in self._state:
-            self._state[session_id] = AgentState()
-        return self._state[session_id]
-
-    def process_message(self, message: str, session_id: Optional[str] = None) -> AgentResponse:
-        """
-        Process a message using ReAct pattern.
+    def _create_tools(self) -> List[Tool]:
+        """Create the tools for the agent."""
         
-        Args:
-            message: The user's message to process.
-            session_id: Optional session ID for tracking conversation history.
-            
-        Returns:
-            A dictionary with the agent's response and performance metrics.
-        """
-        # Generate a session ID if not provided
-        if not session_id:
-            session_id = str(uuid.uuid4())
-            
-        logger.info(f"Processing message for session {session_id}: {message}")
-        
-        # Try to get response from cache if caching is enabled
-        if self.use_cache:
-            cache_key = self._generate_cache_key(message)
-            cached_response = self._get_from_cache(cache_key)
-            
-            if cached_response:
-                logger.info(f"Cache hit for message: {message}")
-                self._cache_hits += 1
+        @tool
+        def search_resources(query: str) -> str:
+            """Search for resources based on a natural language query. The query will be parsed to extract locations, skills, and ranks."""
+            try:
+                # Get valid parameters from metadata
+                metadata = get_database_metadata()
                 
-                return {
-                    "response": cached_response,
-                    "cached": True,
-                    "execution_time": 0.0
+                # Extract parameters from query
+                params = self.extract_query_parameters(query)
+                
+                # Validate parameters against metadata
+                validated_params = {
+                    "locations": [loc for loc in params["locations"] if loc in metadata["locations"]],
+                    "skills": [skill for skill in params["skills"] if skill in metadata["skills"]],
+                    "ranks": [rank for rank in params["ranks"] if rank in metadata["ranks"]],
+                    "collection": "employees",
+                    "nested_ranks": True
                 }
-            
-            self._cache_misses += 1
-        
-        # Start timing
-        start_time = time.time()
-        
+                
+                logger.info(f"Searching with validated parameters: {validated_params}")
+                resources = self.firebase_client.get_resources(**validated_params)
+                
+                return json.dumps({
+                    "found": len(resources),
+                    "resources": resources,
+                    "parameters": validated_params
+                })
+            except Exception as e:
+                return f"Error searching resources: {str(e)}"
+
+        @tool
+        def check_availability(employee_numbers: List[str], weeks: List[int]) -> str:
+            """Check availability for specific employees in given weeks."""
+            try:
+                # Validate week numbers
+                valid_weeks = [w for w in weeks if isinstance(w, int) and 1 <= w <= 52]
+                if not valid_weeks:
+                    return "Error: No valid week numbers provided"
+                
+                # Validate employee numbers
+                valid_employees = [
+                    emp for emp in employee_numbers 
+                    if isinstance(emp, str) and emp.startswith('EMP')
+                ]
+                if not valid_employees:
+                    return "Error: No valid employee numbers provided"
+                
+                availability = self.firebase_client._fetch_availability_batch(
+                    employee_numbers=valid_employees,
+                    weeks=valid_weeks
+                )
+                return json.dumps(availability)
+            except Exception as e:
+                return f"Error checking availability: {str(e)}"
+
+        return [search_resources, check_availability]
+
+    def process_message(self, message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Process a message using the ReAct agent."""
         try:
-            # Get session state
-            state = self._get_or_create_state(session_id)
-            
-            # Update metadata if needed
-            if not state.metadata and self.firebase_client:
-                try:
-                    metadata = self.firebase_client.get_resource_metadata()
-                    state.update_metadata(metadata)
-                except Exception as e:
-                    logger.error(f"Error fetching metadata: {e}")
-            
-            # First, let the agent reason about the query
-            reasoning_prompt = f'''You are Resource Genie, an AI assistant that helps users find resources based on their needs.
-            You have access to a database of employees and their availability information.
-            
-            Current date: {datetime.now().strftime("%Y-%m-%d")}
-            Current week number: {datetime.now().isocalendar()[1]}
-            
-            Previous context: {state.current_context}
-            Previous results: {len(state.previous_results)} resources found
-            
-            Available database metadata:
-            {json.dumps(state.metadata, indent=2) if state.metadata else "Metadata not available"}
-            
-            The user's message is: "{message}"
-            
-            Your task is to analyze the query and return a STRICTLY FORMATTED JSON response.
-            The response MUST follow this exact structure and contain only valid values:
-            
-            {{
-                "query_type": "new_search" or "followup",
-                "needs_availability": true or false,
-                "time_period": {{
-                    "type": "specific_weeks" or "relative",
-                    "weeks": [valid week numbers between 1-52],
-                    "relative_reference": "next_month" or "this_month" or "next_week" or null,
-                    "reasoning": "Explain how you determined these weeks"
-                }},
-                "locations": {{
-                    "mentioned": [locations exactly as mentioned in query],
-                    "resolved": [must be from: {", ".join(state.metadata.get("locations", []))} if available],
-                    "reasoning": "Explain how you mapped locations"
-                }},
-                "reasoning": "Explain your overall analysis",
-                "next_action": "search_resources" or "fetch_availability" or "use_previous_results"
-            }}
-            
-            Example for "Partners in Nordics":
-            {{
-                "query_type": "new_search",
-                "needs_availability": false,
-                "time_period": {{
-                    "type": "specific_weeks",
-                    "weeks": [],
-                    "relative_reference": null,
-                    "reasoning": "No time period mentioned in query"
-                }},
-                "locations": {{
-                    "mentioned": ["Nordics"],
-                    "resolved": ["Oslo", "Stockholm", "Copenhagen"],
-                    "reasoning": "Nordics region maps to Oslo, Stockholm, and Copenhagen in our database"
-                }},
-                "reasoning": "New search for Partners in Nordic locations",
-                "next_action": "search_resources"
-            }}
-            
-            IMPORTANT: 
-            1. Only use valid location names from the metadata
-            2. Week numbers must be between 1 and 52
-            3. Query type must be exactly "new_search" or "followup"
-            4. All fields are required
-            '''
-            
-            # Get the agent's analysis
-            analysis_messages = [
-                SystemMessage(content=reasoning_prompt),
-                HumanMessage(content=message)
-            ]
-            
-            analysis_response = self.model.invoke(analysis_messages)
-            analysis = self._parse_json_response(analysis_response.content)
-            logger.info(f"Query analysis: {analysis}")
-            
-            # Let the agent decide what to do next
-            if analysis["needs_availability"]:
-                # Handle availability query
-                week_numbers = analysis["time_period"]["weeks"]
-                logger.info(f"Weeks to check: {week_numbers}")
-                
-                if analysis["query_type"] == "followup":
-                    resources = state.previous_results
-                    logger.info(f"Using previous results ({len(resources)} resources)")
-                else:
-                    # New search with availability
-                    resources = self._fetch_resources(analysis, state)
-                
-                # Fetch availability data
-                if resources and week_numbers:
-                    resources = self._fetch_availability(resources, week_numbers)
-                
-                # Generate response about availability
-                response_text = self._generate_availability_response(resources, analysis, message)
-            else:
-                # Handle normal search
-                resources = self._fetch_resources(analysis, state)
-                response_text = self._generate_search_response(resources, analysis, message)
-            
-            # Update state
-            state.previous_results = resources
-            state.current_context.update({
-                "last_query_type": analysis["query_type"],
-                "last_time_period": analysis["time_period"],
-                "last_locations": analysis["locations"]
-            })
-            
-            # Handle caching and timing
-            execution_time = time.time() - start_time
-            if self.use_cache:
-                self._add_to_cache(cache_key, response_text)
-            
-            logger.info(f"Message processed in {execution_time:.2f} seconds")
-            
+            logger.info(f"Processing message: {message}")
+            if not session_id:
+                session_id = str(uuid.uuid4())
+                logger.info(f"Generated new session ID: {session_id}")
+
+            # Create message for the agent
+            messages = [{"role": "user", "content": message}]
+
+            # Invoke agent with thread_id for memory persistence
+            logger.info("Invoking ReAct agent")
+            final_state = self.agent.invoke(
+                {"messages": messages},
+                config={"configurable": {"thread_id": session_id}}
+            )
+            logger.info("Agent execution completed")
+
+            # Extract response from final state
+            response = final_state["messages"][-1].content
+
             return {
-                "response": response_text,
-                "execution_time": execution_time,
-                "cached": False
+                "response": response,
+                "state": final_state
             }
-                
+
         except Exception as e:
-            logger.error(f"Error processing message: {e}")
-            execution_time = time.time() - start_time
-            
+            logger.error(f"Critical error in process_message: {str(e)}", exc_info=True)
             return {
-                "response": f"I encountered an error while processing your request: {str(e)}",
-                "execution_time": execution_time,
-                "cached": False
+                "response": "I apologize, but something went wrong while processing your request. Please try again.",
+                "error": str(e)
             }
 
     def reset(self, session_id: Optional[str] = None) -> None:
-        """
-        Reset the agent's state for a specific session or all sessions.
-        
-        Args:
-            session_id: Optional session ID to reset. If None, resets all sessions.
-        """
+        """Reset the agent's state."""
         if session_id:
-            # Remove the specific session
-            if session_id in self._sessions:
-                del self._sessions[session_id]
-                logger.info(f"Reset session {session_id}")
-            else:
-                logger.warning(f"Session {session_id} not found")
+            # Clear specific session state
+            self.checkpointer.delete_state(session_id)
+            logger.info(f"Reset session {session_id}")
         else:
-            # Reset all sessions
-            self._sessions = {}
+            # Clear all session states
+            self.checkpointer.clear()
             logger.info("Reset all sessions")
 
     def _generate_cache_key(self, message: str) -> str:
@@ -590,7 +937,7 @@ class ReActAgentGraph:
             
             availability_data = self.firebase_client._fetch_availability_batch(
                 employee_numbers=employee_numbers,
-                week_numbers=valid_weeks
+                weeks=valid_weeks
             )
             
             # Add availability data to resources
@@ -658,16 +1005,25 @@ class ReActAgentGraph:
     def _parse_json_response(self, content: str) -> dict:
         """Parse and validate JSON from LLM response."""
         try:
+            # First try to find JSON between triple backticks
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0].strip()
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0].strip()
+            else:
+                # If no code blocks, try to find JSON between curly braces
+                start_idx = content.find('{')
+                end_idx = content.rfind('}')
+                if start_idx != -1 and end_idx != -1:
+                    content = content[start_idx:end_idx + 1].strip()
+            
+            # Remove any trailing or leading text
+            content = content.strip()
+            if not content.startswith('{'):
+                raise ValueError("No valid JSON object found in response")
             
             parsed = json.loads(content)
-            
-            # Log the parsed structure for debugging
-            logger.info(f"Parsed JSON structure: {list(parsed.keys())}")
-            
+            logger.info(f"Successfully parsed JSON structure with keys: {list(parsed.keys())}")
             return parsed
         except Exception as e:
             logger.error(f"Error parsing JSON response: {e}")

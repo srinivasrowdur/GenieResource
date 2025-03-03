@@ -83,7 +83,7 @@ def initialize_agent():
         
         # Initialize the model
         model = ChatAnthropic(
-            model="claude-3-5-sonnet-20240620",
+            model="claude-3-5-haiku-20241022",
             anthropic_api_key=anthropic_api_key,
             temperature=0
         )
