@@ -612,37 +612,57 @@ class ReActAgentGraph:
 
     def process_message(self, message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
         """Process a message using the ReAct agent."""
-        try:
-            logger.info(f"Processing message: {message}")
-            if not session_id:
-                session_id = str(uuid.uuid4())
-                logger.info(f"Generated new session ID: {session_id}")
+        max_retries = 3
+        base_delay = 2  # Base delay in seconds
+        
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"Processing message: {message}")
+                if not session_id:
+                    session_id = str(uuid.uuid4())
+                    logger.info(f"Generated new session ID: {session_id}")
 
-            # Create message for the agent
-            messages = [{"role": "user", "content": message}]
+                # Create message for the agent
+                messages = [{"role": "user", "content": message}]
 
-            # Invoke agent with thread_id for memory persistence
-            logger.info("Invoking ReAct agent")
-            final_state = self.agent.invoke(
-                {"messages": messages},
-                config={"configurable": {"thread_id": session_id}}
-            )
-            logger.info("Agent execution completed")
+                # Invoke agent with thread_id for memory persistence
+                logger.info(f"Invoking ReAct agent (attempt {attempt + 1}/{max_retries})")
+                final_state = self.agent.invoke(
+                    {"messages": messages},
+                    config={"configurable": {"thread_id": session_id}}
+                )
+                logger.info("Agent execution completed")
 
-            # Extract response from final state
-            response = final_state["messages"][-1].content
+                # Extract response from final state
+                response = final_state["messages"][-1].content
 
-            return {
-                "response": response,
-                "state": final_state
-            }
+                return {
+                    "response": response,
+                    "state": final_state
+                }
 
-        except Exception as e:
-            logger.error(f"Critical error in process_message: {str(e)}", exc_info=True)
-            return {
-                "response": "I apologize, but something went wrong while processing your request. Please try again.",
-                "error": str(e)
-            }
+            except Exception as e:
+                error_message = str(e)
+                logger.error(f"Error in process_message attempt {attempt + 1}: {error_message}")
+                
+                # Check if it's an overload error
+                if "overloaded_error" in error_message and attempt < max_retries - 1:
+                    delay = base_delay * (2 ** attempt)  # Exponential backoff
+                    logger.info(f"API overloaded. Retrying in {delay} seconds...")
+                    time.sleep(delay)
+                    continue
+                
+                # If it's the last attempt or not an overload error, return error response
+                if attempt == max_retries - 1:
+                    return {
+                        "response": "I apologize, but the service is currently experiencing high load. Please try again in a few moments.",
+                        "error": error_message
+                    }
+                
+                return {
+                    "response": "I apologize, but something went wrong while processing your request. Please try again.",
+                    "error": error_message
+                }
 
     def reset(self, session_id: Optional[str] = None) -> None:
         """Reset the agent's state."""
@@ -967,12 +987,15 @@ class ReActAgentGraph:
         } for r in resources], indent=2)}
         
         Generate a response that includes:
-        1. Clear summary of who is available/unavailable
-        2. Specific availability status for each week requested
-        3. Any relevant notes about availability
-        4. Suggestions if no one is available
+        1. Total number of Partners found and their locations
+        2. For each week:
+           - List who is fully available
+           - List who is partially available
+           - List who is not available
+        3. Summary of best availability (who has the most availability across all weeks)
         
-        Format numbers and lists clearly in your response.
+        Format the response in a clear, structured way with bullet points and sections.
+        Make sure to mention both names and locations for context.
         """
         
         response = self.model.invoke([SystemMessage(content=prompt)])
