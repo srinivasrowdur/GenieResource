@@ -46,6 +46,11 @@ class AgentState:
         self.current_context = {}   # Store current conversation context
         self.last_query = None      # Store last query parameters
         self.conversation_history = []  # Store conversation history
+        self.metadata = None  # Store database metadata
+
+    def update_metadata(self, metadata: dict):
+        """Update metadata from database"""
+        self.metadata = metadata
 
 # Main agent class
 class ReActAgentGraph:
@@ -110,7 +115,7 @@ class ReActAgentGraph:
 
     def process_message(self, message: str, session_id: Optional[str] = None) -> AgentResponse:
         """
-        Process a message using a simple chat model approach.
+        Process a message using ReAct pattern.
         
         Args:
             message: The user's message to process.
@@ -149,60 +154,74 @@ class ReActAgentGraph:
             # Get session state
             state = self._get_or_create_state(session_id)
             
-            # First, let the agent reason about the query and decide what to do
+            # Update metadata if needed
+            if not state.metadata and self.firebase_client:
+                try:
+                    metadata = self.firebase_client.get_resource_metadata()
+                    state.update_metadata(metadata)
+                except Exception as e:
+                    logger.error(f"Error fetching metadata: {e}")
+            
+            # First, let the agent reason about the query
             reasoning_prompt = f'''You are Resource Genie, an AI assistant that helps users find resources based on their needs.
             You have access to a database of employees and their availability information.
+            
+            Current date: {datetime.now().strftime("%Y-%m-%d")}
+            Current week number: {datetime.now().isocalendar()[1]}
             
             Previous context: {state.current_context}
             Previous results: {len(state.previous_results)} resources found
             
+            Available database metadata:
+            {json.dumps(state.metadata, indent=2) if state.metadata else "Metadata not available"}
+            
             The user's message is: "{message}"
             
-            First, analyze what the user is asking for and decide what actions to take.
-            Consider:
-            1. Is this a new query or a follow-up question?
-            2. What information do we need to answer this?
-            3. What time period are they asking about? (specific weeks, next month, etc.)
-            4. Do we need to fetch new data or can we use existing data?
+            Your task is to analyze the query and return a STRICTLY FORMATTED JSON response.
+            The response MUST follow this exact structure and contain only valid values:
             
-            Return your analysis as JSON with this structure:
+            {{
+                "query_type": "new_search" or "followup",
+                "needs_availability": true or false,
+                "time_period": {{
+                    "type": "specific_weeks" or "relative",
+                    "weeks": [valid week numbers between 1-52],
+                    "relative_reference": "next_month" or "this_month" or "next_week" or null,
+                    "reasoning": "Explain how you determined these weeks"
+                }},
+                "locations": {{
+                    "mentioned": [locations exactly as mentioned in query],
+                    "resolved": [must be from: {", ".join(state.metadata.get("locations", []))} if available],
+                    "reasoning": "Explain how you mapped locations"
+                }},
+                "reasoning": "Explain your overall analysis",
+                "next_action": "search_resources" or "fetch_availability" or "use_previous_results"
+            }}
+            
+            Example for "Partners in Nordics":
             {{
                 "query_type": "new_search",
                 "needs_availability": false,
                 "time_period": {{
                     "type": "specific_weeks",
                     "weeks": [],
-                    "relative_reference": null
+                    "relative_reference": null,
+                    "reasoning": "No time period mentioned in query"
                 }},
-                "reasoning": "Explain your reasoning here",
-                "next_action": "What should be done next"
+                "locations": {{
+                    "mentioned": ["Nordics"],
+                    "resolved": ["Oslo", "Stockholm", "Copenhagen"],
+                    "reasoning": "Nordics region maps to Oslo, Stockholm, and Copenhagen in our database"
+                }},
+                "reasoning": "New search for Partners in Nordic locations",
+                "next_action": "search_resources"
             }}
             
-            Example for "Are they available next month?":
-            {{
-                "query_type": "followup",
-                "needs_availability": true,
-                "time_period": {{
-                    "type": "relative",
-                    "weeks": [],
-                    "relative_reference": "next_month"
-                }},
-                "reasoning": "This is a follow-up question asking about availability for next month",
-                "next_action": "fetch_availability_data"
-            }}
-            
-            Example for "Check week 2 availability":
-            {{
-                "query_type": "followup",
-                "needs_availability": true,
-                "time_period": {{
-                    "type": "specific_weeks",
-                    "weeks": [2],
-                    "relative_reference": null
-                }},
-                "reasoning": "This is a follow-up question asking about availability for a specific week",
-                "next_action": "fetch_availability_data"
-            }}
+            IMPORTANT: 
+            1. Only use valid location names from the metadata
+            2. Week numbers must be between 1 and 52
+            3. Query type must be exactly "new_search" or "followup"
+            4. All fields are required
             '''
             
             # Get the agent's analysis
@@ -212,319 +231,53 @@ class ReActAgentGraph:
             ]
             
             analysis_response = self.model.invoke(analysis_messages)
-            analysis_content = analysis_response.content
+            analysis = self._parse_json_response(analysis_response.content)
+            logger.info(f"Query analysis: {analysis}")
             
-            # Extract JSON from the response
-            try:
-                if "```json" in analysis_content:
-                    analysis_content = analysis_content.split("```json")[1].split("```")[0].strip()
-                elif "```" in analysis_content:
-                    analysis_content = analysis_content.split("```")[1].split("```")[0].strip()
-                
-                analysis = json.loads(analysis_content)
-                logger.info(f"Query analysis: {analysis}")
-            except Exception as e:
-                logger.error(f"Error parsing analysis: {e}")
-                analysis = {
-                    "query_type": "new_search",
-                    "needs_availability": False,
-                    "time_period": {"type": "specific_weeks", "weeks": [], "relative_reference": None},
-                    "reasoning": "Failed to parse analysis",
-                    "next_action": "proceed_with_search"
-                }
-            
-            # Based on the analysis, take appropriate action
+            # Let the agent decide what to do next
             if analysis["needs_availability"]:
-                # Calculate weeks based on the analysis
-                week_numbers = []
-                if analysis["time_period"]["type"] == "specific_weeks":
-                    week_numbers = analysis["time_period"]["weeks"]
-                elif analysis["time_period"]["relative_reference"] == "same_as_previous":
-                    # Use the same weeks as the previous query
-                    if state.last_query and "week_numbers" in state.current_context:
-                        week_numbers = state.current_context["week_numbers"]
-                        logger.info(f"Using weeks from previous query: {week_numbers}")
-                else:
-                    # Calculate weeks based on relative reference
-                    current_week = datetime.now().isocalendar()[1]
-                    if analysis["time_period"]["relative_reference"] == "next_month":
-                        week_numbers = [w if w <= 52 else w - 52 for w in range(current_week + 1, current_week + 5)]
-                    elif analysis["time_period"]["relative_reference"] == "this_month":
-                        week_numbers = [w if w <= 52 else w - 52 for w in range(current_week, current_week + 4)]
-                    elif analysis["time_period"]["relative_reference"] == "next_week":
-                        week_numbers = [current_week + 1 if current_week < 52 else 1]
-                
-                # Store current week numbers in context for future reference
-                state.current_context["week_numbers"] = week_numbers
-                logger.info(f"Calculated week numbers: {week_numbers}")
+                # Handle availability query
+                week_numbers = analysis["time_period"]["weeks"]
+                logger.info(f"Weeks to check: {week_numbers}")
                 
                 if analysis["query_type"] == "followup":
-                    # Use existing resources for follow-up
                     resources = state.previous_results
                     logger.info(f"Using previous results ({len(resources)} resources)")
                 else:
-                    # New search - fetch resources first
-                    query_params = self.extract_query_parameters(message)
-                    resources = []
-                    
-                    if self.firebase_client and (self.firebase_client.is_connected or self.firebase_client.is_demo_mode):
-                        try:
-                            # Get the query parameters
-                            locations = query_params.get("locations", [])
-                            skills = query_params.get("skills", [])
-                            ranks = query_params.get("ranks", [])
-                            
-                            logger.info(f"Searching for: locations={locations}, skills={skills}, ranks={ranks}")
-                            
-                            # Use the standard get_resources method
-                            resources = self.firebase_client.get_resources(
-                                locations=locations,
-                                skills=skills,
-                                ranks=ranks,
-                                collection='employees',
-                                nested_ranks=True
-                            )
-                            
-                            logger.info(f"Found {len(resources)} resources in database")
-                            
-                            # Store results in state for follow-up questions
-                            state.previous_results = resources
-                            state.last_query = query_params
-                            
-                        except Exception as e:
-                            logger.error(f"Error querying resources: {e}")
-                            resources = []
+                    # New search with availability
+                    resources = self._fetch_resources(analysis, state)
                 
-                # Fetch availability data for the resources
-                if self.firebase_client and not self.firebase_client.is_demo_mode and resources and week_numbers:  # Only fetch if we have week numbers
-                    employee_numbers = [str(r.get('employee_number')) for r in resources if r.get('employee_number')]
-                    if employee_numbers:
-                        availability_data = self.firebase_client._fetch_availability_batch(employee_numbers, week_numbers)
-                        
-                        # Add availability data to resources
-                        for resource in resources:
-                            emp_num = str(resource.get('employee_number'))
-                            if emp_num in availability_data:
-                                resource['availability'] = availability_data[emp_num]
-                            else:
-                                resource['availability'] = []
+                # Fetch availability data
+                if resources and week_numbers:
+                    resources = self._fetch_availability(resources, week_numbers)
                 
-                # Generate response with availability information
-                response_prompt = f"""You are Resource Genie, an AI assistant that helps users find resources based on their needs.
-                
-                The user asked about availability for {analysis["time_period"]["relative_reference"] or f"week(s) {week_numbers}"}.
-                Here are the resources and their availability:
-                
-                {json.dumps([{
-                    'name': r.get('name'),
-                    'location': r.get('location'),
-                    'rank': r.get('rank', {}).get('official_name') if isinstance(r.get('rank'), dict) else r.get('rank'),
-                    'availability': r.get('availability', [])
-                } for r in resources], indent=2)}
-                
-                Please provide a helpful summary focusing on:
-                1. Who is available and who isn't for the requested time period
-                2. Any relevant notes about their availability
-                3. Upcoming availability if that information is available
-                4. Any missing availability information
-                
-                Be concise but informative.
-                """
-                
-                messages = [
-                    SystemMessage(content=response_prompt),
-                    HumanMessage(content=message)
-                ]
-                
-                response = self.model.invoke(messages)
-                response_text = response.content
-                
-                # Calculate execution time
-                execution_time = time.time() - start_time
-                
-                # Cache the response if enabled
-                if self.use_cache:
-                    cache_key = self._generate_cache_key(message)
-                    self._add_to_cache(cache_key, response_text)
-                
-                logger.info(f"Message processed in {execution_time:.2f} seconds")
-                
-                return {
-                    "response": response_text,
-                    "execution_time": execution_time,
-                    "cached": False
-                }
-                
+                # Generate response about availability
+                response_text = self._generate_availability_response(resources, analysis, message)
             else:
-                # Handle new search or non-availability query
-                # Extract query parameters and proceed with normal search
-                query_params = self.extract_query_parameters(message)
-                
-                # Normal query processing
-                resources = []
-                firebase_connected = False
-                
-                if self.firebase_client and (self.firebase_client.is_connected or self.firebase_client.is_demo_mode):
-                    firebase_connected = True
-                    try:
-                        # Check for demo mode
-                        if self.firebase_client.is_demo_mode:
-                            logger.info(f"Using demo mode for resources")
-                            resources = self.firebase_client._get_sample_resources(
-                                locations=query_params.get("locations", []),
-                                skills=query_params.get("skills", []),
-                                ranks=query_params.get("ranks", [])
-                            )
-                        else:
-                            # Get the query parameters
-                            locations = query_params.get("locations", [])
-                            skills = query_params.get("skills", [])
-                            ranks = query_params.get("ranks", [])
-                            
-                            # For the real database, we know it's using 'employees' collection with 100 records
-                            collection_name = 'employees'
-                            logger.info(f"Using '{collection_name}' collection from real database")
-                            
-                            # Log the search criteria
-                            logger.info(f"Searching for: locations={locations}, skills={skills}, ranks={ranks}")
-                            
-                            # Add debugging for rank structure (we know ranks are nested objects)
-                            logger.info("✓ Note: Ranks in this database are nested objects with 'official_name' field")
-                            logger.info("✓ Looking for ranks with official_name matching: " + ", ".join(ranks))
-                            
-                            # Use the standard get_resources method but specify the collection and nested_ranks=True
-                            resources = self.firebase_client.get_resources(
-                                locations=locations,
-                                skills=skills,
-                                ranks=ranks,
-                                collection='employees',  # Explicitly use employees collection
-                                nested_ranks=True  # Tell the method to look for nested rank structure
-                            )
-                        
-                        logger.info(f"Found {len(resources)} resources in database/demo")
-                        
-                        # Log the resources for debugging
-                        if resources:
-                            for i, resource in enumerate(resources[:3]):  # Log up to 3 resources to avoid clutter
-                                logger.info(f"Resource {i+1}: {resource.get('name', 'Unknown')} - {resource.get('rank', 'Unknown')} in {resource.get('location', 'Unknown')}")
-                            if len(resources) > 3:
-                                logger.info(f"...and {len(resources) - 3} more resources")
-                        
-                        # Store results in state for follow-up questions
-                        state.previous_results = resources
-                        state.last_query = query_params
-                        
-                    except Exception as e:
-                        logger.error(f"Error querying resources: {e}")
-                        resources = []
-                
-                # Get conversation history
-                history = self._sessions.get(session_id, [])
-                
-                # Step 3: Generate response based on the query results
-                response_prompt = f"""You are Resource Genie, an AI assistant that helps users find resources based on their needs.
-                
-                The user is looking for resources with the following parameters:
-                - Locations: {', '.join(query_params.get('locations', [])) or 'Not specified'}
-                - Skills: {', '.join(query_params.get('skills', [])) or 'Not specified'}
-                - Ranks: {', '.join(query_params.get('ranks', [])) or 'Not specified'}
-                
-                {"I found the following matching resources:" if resources else "I couldn't find any resources matching those criteria."}
-                """
-                
-                # Add resources to the prompt if any were found
-                if resources:
-                    resource_details = []
-                    for i, resource in enumerate(resources[:10]):  # Limit to 10 resources to avoid huge prompts
-                        details = f"""
-                        Resource {i+1}:
-                        Name: {resource.get('name', 'Unknown')}
-                        Location: {resource.get('location', 'Unknown')}
-                        Rank: {resource.get('rank', 'Unknown')}
-                        Skills: {', '.join(resource.get('skills', []))}
-                        Availability: {resource.get('availability', 'Unknown')}
-                        """
-                        resource_details.append(details)
-                    
-                    response_prompt += "\n\n" + "\n".join(resource_details)
-                    
-                    if len(resources) > 10:
-                        response_prompt += f"\n\nAnd {len(resources) - 10} more resources not shown."
-                
-                response_prompt += """
-                
-                Respond in a helpful, conversational way to the user's query. Focus on the resources that match their criteria.
-                If no resources match, suggest broadening their search criteria.
-                """
-                
-                # Prepare messages for the model
-                messages = [
-                    SystemMessage(content=response_prompt),
-                ]
-                
-                # Add the new message
-                messages.append(HumanMessage(content=message))
-                
-                # Call the model
-                response = self.model.invoke(messages)
-                
-                # Extract response text
-                response_text = response.content
-                
-                # Update session history
-                new_history = history.copy()
-                new_history.append(HumanMessage(content=message))
-                new_history.append(AIMessage(content=response_text))
-                
-                # Keep only the last 10 messages to avoid context overflow
-                if len(new_history) > 10:
-                    new_history = new_history[-10:]
-                    
-                # Save updated history
-                self._sessions[session_id] = new_history
-                
-                # Step 4: Save query data if Firebase is available
-                if firebase_connected:
-                    try:
-                        # Create metadata from extracted parameters
-                        metadata = {
-                            "timestamp": datetime.now().isoformat(),
-                            "query_length": len(message),
-                            "response_length": len(response_text),
-                            "locations": query_params.get("locations", []),
-                            "skills": query_params.get("skills", []),
-                            "ranks": query_params.get("ranks", [])
-                        }
-                        
-                        # Save query data
-                        query_id = self.firebase_client.save_query_data(
-                            query=message,
-                            response=response_text,
-                            metadata=metadata,
-                            session_id=session_id
-                        )
-                        
-                        if query_id:
-                            logger.info(f"✅ Query data saved to Firestore with ID: {query_id}")
-                    
-                    except Exception as e:
-                        logger.error(f"Error saving query data: {e}")
-                
-                # Calculate execution time
-                execution_time = time.time() - start_time
-                
-                # Cache the response if caching is enabled
-                if self.use_cache:
-                    cache_key = self._generate_cache_key(message)
-                    self._add_to_cache(cache_key, response_text)
-                
-                logger.info(f"Message processed in {execution_time:.2f} seconds")
-                
-                return {
-                    "response": response_text,
-                    "execution_time": execution_time,
-                    "cached": False
-                }
+                # Handle normal search
+                resources = self._fetch_resources(analysis, state)
+                response_text = self._generate_search_response(resources, analysis, message)
+            
+            # Update state
+            state.previous_results = resources
+            state.current_context.update({
+                "last_query_type": analysis["query_type"],
+                "last_time_period": analysis["time_period"],
+                "last_locations": analysis["locations"]
+            })
+            
+            # Handle caching and timing
+            execution_time = time.time() - start_time
+            if self.use_cache:
+                self._add_to_cache(cache_key, response_text)
+            
+            logger.info(f"Message processed in {execution_time:.2f} seconds")
+            
+            return {
+                "response": response_text,
+                "execution_time": execution_time,
+                "cached": False
+            }
                 
         except Exception as e:
             logger.error(f"Error processing message: {e}")
@@ -745,3 +498,178 @@ class ReActAgentGraph:
             logger.warning(f"Failed to parse extracted parameters, using defaults")
         
         return query_params 
+
+    def _fetch_resources(self, analysis: dict, state: AgentState) -> List[dict]:
+        """Fetch resources based on analysis with strict parameter validation."""
+        try:
+            # Define valid parameters from metadata
+            valid_params = {
+                "locations": state.metadata.get("locations", []),
+                "skills": state.metadata.get("skills", []),
+                "ranks": state.metadata.get("ranks", [])
+            }
+
+            # Extract and validate locations
+            locations = [
+                loc for loc in analysis["locations"]["resolved"]
+                if loc in valid_params["locations"]
+            ]
+
+            # Get other parameters with strict validation
+            params_prompt = f"""You are a parameter validator for database queries.
+            Your task is to extract search parameters that EXACTLY match our database values.
+
+            VALID VALUES (only these can be used):
+            LOCATIONS: {json.dumps(valid_params["locations"])}
+            SKILLS: {json.dumps(valid_params["skills"])}
+            RANKS: {json.dumps(valid_params["ranks"])}
+
+            User Query Analysis:
+            {json.dumps(analysis, indent=2)}
+
+            Return a JSON object with EXACTLY this structure:
+            {{
+                "skills": [list of skills from VALID SKILLS only],
+                "ranks": [list of ranks from VALID RANKS only],
+                "validation_notes": "Explain which parameters were valid/invalid"
+            }}
+
+            IMPORTANT:
+            - Only use values from the valid lists
+            - Invalid values will be ignored
+            - Lists can be empty if no valid values found
+            """
+            
+            params_response = self.model.invoke([SystemMessage(content=params_prompt)])
+            params = self._parse_json_response(params_response.content)
+            
+            # Validate parameters
+            validated_params = {
+                "locations": locations,
+                "skills": [s for s in params["skills"] if s in valid_params["skills"]],
+                "ranks": [r for r in params["ranks"] if r in valid_params["ranks"]],
+                "collection": "employees",
+                "nested_ranks": True
+            }
+
+            logger.info(f"Validated parameters for Firebase: {validated_params}")
+            if params.get("validation_notes"):
+                logger.info(f"Validation notes: {params['validation_notes']}")
+
+            return self.firebase_client.get_resources(**validated_params)
+
+        except Exception as e:
+            logger.error(f"Error in parameter validation: {e}")
+            return []
+
+    def _fetch_availability(self, resources: List[dict], week_numbers: List[int]) -> List[dict]:
+        """Fetch availability data with strict parameter validation."""
+        try:
+            # Validate employee numbers
+            employee_numbers = [
+                str(r.get('employee_number')) 
+                for r in resources 
+                if r.get('employee_number') and str(r.get('employee_number')).startswith('EMP')
+            ]
+
+            # Validate week numbers
+            valid_weeks = [
+                w for w in week_numbers 
+                if isinstance(w, int) and 1 <= w <= 52
+            ]
+
+            if not valid_weeks:
+                logger.warning(f"No valid week numbers found in: {week_numbers}")
+                return resources
+
+            if not employee_numbers:
+                logger.warning("No valid employee numbers found")
+                return resources
+
+            logger.info(f"Fetching availability for {len(employee_numbers)} employees in weeks {valid_weeks}")
+            
+            availability_data = self.firebase_client._fetch_availability_batch(
+                employee_numbers=employee_numbers,
+                week_numbers=valid_weeks
+            )
+            
+            # Add availability data to resources
+            for resource in resources:
+                emp_num = str(resource.get('employee_number'))
+                resource['availability'] = availability_data.get(emp_num, [])
+
+            return resources
+
+        except Exception as e:
+            logger.error(f"Error in availability validation: {e}")
+            return resources
+
+    def _generate_availability_response(self, resources: List[dict], analysis: dict, message: str) -> str:
+        """Generate response for availability queries with structured data."""
+        prompt = f"""You are Resource Genie, an AI assistant that helps users find resources based on their needs.
+        
+        Query Analysis:
+        {json.dumps(analysis, indent=2)}
+        
+        Resource Data:
+        {json.dumps([{
+            'name': r.get('name'),
+            'location': r.get('location'),
+            'rank': r.get('rank', {}).get('official_name') if isinstance(r.get('rank'), dict) else r.get('rank'),
+            'availability': r.get('availability', [])
+        } for r in resources], indent=2)}
+        
+        Generate a response that includes:
+        1. Clear summary of who is available/unavailable
+        2. Specific availability status for each week requested
+        3. Any relevant notes about availability
+        4. Suggestions if no one is available
+        
+        Format numbers and lists clearly in your response.
+        """
+        
+        response = self.model.invoke([SystemMessage(content=prompt)])
+        return response.content
+
+    def _generate_search_response(self, resources: List[dict], analysis: dict, message: str) -> str:
+        """Generate response for search queries."""
+        prompt = f"""You are Resource Genie, an AI assistant that helps users find resources based on their needs.
+        
+        The user's query: "{message}"
+        
+        Analysis of the query:
+        {json.dumps(analysis, indent=2)}
+        
+        Here are the matching resources:
+        {json.dumps([{
+            'name': r.get('name'),
+            'location': r.get('location'),
+            'rank': r.get('rank', {}).get('official_name') if isinstance(r.get('rank'), dict) else r.get('rank'),
+            'skills': r.get('skills', [])
+        } for r in resources], indent=2)}
+        
+        Please provide a helpful summary of the results. If no resources match, suggest ways to broaden the search.
+        Be concise but informative.
+        """
+        
+        response = self.model.invoke([SystemMessage(content=prompt)])
+        return response.content
+
+    def _parse_json_response(self, content: str) -> dict:
+        """Parse and validate JSON from LLM response."""
+        try:
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            
+            parsed = json.loads(content)
+            
+            # Log the parsed structure for debugging
+            logger.info(f"Parsed JSON structure: {list(parsed.keys())}")
+            
+            return parsed
+        except Exception as e:
+            logger.error(f"Error parsing JSON response: {e}")
+            logger.error(f"Raw content: {content}")
+            raise 
