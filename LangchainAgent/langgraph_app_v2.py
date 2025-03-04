@@ -41,17 +41,11 @@ firebase_creds_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                  "resgenie-e8ab5-firebase-adminsdk-fbsvc-eb9f384590.json")
 
 # Verify the file exists
-if os.path.exists(firebase_creds_path):
-    st.sidebar.success(f"Found Firebase credentials at: {firebase_creds_path}")
-else:
-    st.sidebar.error(f"Firebase credentials file not found at: {firebase_creds_path}")
+if not os.path.exists(firebase_creds_path):
     # Try the project root as a fallback
     project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     firebase_creds_path = os.path.join(project_root, "resgenie-e8ab5-firebase-adminsdk-fbsvc-eb9f384590.json")
-    if os.path.exists(firebase_creds_path):
-        st.sidebar.success(f"Found Firebase credentials at project root: {firebase_creds_path}")
-    else:
-        st.sidebar.error(f"Firebase credentials not found in project root either")
+    if not os.path.exists(firebase_creds_path):
         firebase_creds_path = None
 
 # Initialize session state
