@@ -91,7 +91,7 @@ class QueryTranslator:
             
             # Get completion from Claude
             response = self.client.messages.create(
-                model="claude-3-sonnet-20240229",
+                model="claude-sonnet-4-5-20250929",
                 max_tokens=1000,
                 messages=[{
                     "role": "user",
@@ -568,7 +568,7 @@ Always maintain the exact terminology specified above. Do not add information th
         
         # Call the LLM with the constructed prompt
         response = self.client.messages.create(
-            model="claude-3-sonnet-20240229",  # Using Claude 3 Sonnet for optimal performance
+            model="claude-sonnet-4-5-20250929",  # Using Claude 3 Sonnet for optimal performance
             max_tokens=1000,                   # Limit response length
             system=full_prompt,                # System prompt with instructions and context
             messages=[

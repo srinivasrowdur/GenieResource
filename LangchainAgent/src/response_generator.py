@@ -74,7 +74,7 @@ Please provide a helpful response that addresses the original question and provi
         
         # Get response from Claude
         response = self.client.messages.create(
-            model="claude-3-sonnet-20240229",
+            model="claude-sonnet-4-5-20250929",
             max_tokens=1000,
             system=system_prompt,
             messages=messages
