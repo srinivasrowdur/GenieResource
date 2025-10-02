@@ -1,0 +1,12 @@
+[server]
+# Disable file watching to prevent inotify instance limit issues in production
+fileWatcherType = "none"
+
+# Additional production optimizations
+headless = true
+enableCORS = false
+enableXsrfProtection = false
+
+[browser]
+# Disable automatic browser opening in production
+gatherUsageStats = false
